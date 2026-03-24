@@ -22,6 +22,9 @@ Pipeline per frame:
 Usage:
     python preprocess_frames.py --data-dir trainingData/ --out-dir processed/
 
+    # Eco mode: only reprocess scenes with missing frames
+    python preprocess_frames.py --data-dir trainingData/ --out-dir processed/ --eco
+
 Output structure:
     processed/
     ├── manifest.csv
@@ -92,10 +95,61 @@ def spherical_to_local_cartesian(df):
     return np.column_stack((x, y, z)).astype(np.float32)
 
 
+# ─── Eco mode helpers ─────────────────────────────────────────────────────────
+def count_existing_npz(out_dir, scene_name):
+    """Return set of existing frame indices for a scene directory."""
+    scene_dir = Path(out_dir) / scene_name
+    if not scene_dir.exists():
+        return set()
+    existing = set()
+    for p in scene_dir.glob("frame_*.npz"):
+        try:
+            idx = int(p.stem.split("_")[1])
+            existing.add(idx)
+        except (IndexError, ValueError):
+            continue
+    return existing
+
+
+def collect_existing_manifest_rows(out_dir, scene_name, existing_indices):
+    """
+    Re-read existing .npz files to rebuild their manifest entries,
+    so the final manifest.csv stays complete even for skipped frames.
+    """
+    rows = []
+    scene_dir = Path(out_dir) / scene_name
+    for idx in sorted(existing_indices):
+        npz_path = scene_dir / f"frame_{idx:03d}.npz"
+        try:
+            data = np.load(npz_path)
+            ego = data["ego_pose"]
+            n_valid = len(data["xyz"])
+            rows.append({
+                "scene": scene_name,
+                "pose_index": idx,
+                "ego_x": ego[0],
+                "ego_y": ego[1],
+                "ego_z": ego[2],
+                "ego_yaw": ego[3],
+                "num_points_raw": -1,       # unknown without re-reading H5
+                "num_points_valid": n_valid,
+                "num_invalid_dropped": -1,   # unknown without re-reading H5
+                "file": str(npz_path),
+            })
+        except Exception as e:
+            print(f"  WARNING: could not read {npz_path}: {e}")
+    return rows
+
+
 # ─── Per-scene processing ────────────────────────────────────────────────────
-def process_scene(file_path, out_dir, verbose=True):
+def process_scene(file_path, out_dir, verbose=True, skip_indices=None):
     """
     Process one HDF5 scene file → per-frame .npz files.
+
+    Parameters
+    ----------
+    skip_indices : set of int or None
+        If provided, skip frames whose pose_index is in this set.
 
     Returns a list of dicts (one per frame) for the manifest.
     """
@@ -111,12 +165,20 @@ def process_scene(file_path, out_dir, verbose=True):
     poses = get_unique_poses(df)
 
     if verbose:
-        print(f"  {len(df):,} total points | {len(poses)} frames")
+        n_skip = len(skip_indices) if skip_indices else 0
+        n_todo = len(poses) - n_skip
+        print(f"  {len(df):,} total points | {len(poses)} frames "
+              f"({n_skip} already exist, {n_todo} to process)")
 
     manifest_rows = []
 
     for _, pose_row in poses.iterrows():
         pose_idx = int(pose_row["pose_index"])
+
+        # ── Eco skip ──
+        if skip_indices and pose_idx in skip_indices:
+            continue
+
         frame = filter_by_pose(df, pose_row)
 
         # ── Step 1: drop invalid beams ──
@@ -200,7 +262,14 @@ def main():
         "--out-dir", default="processed/",
         help="Output directory for .npz files and manifest",
     )
+    parser.add_argument(
+        "--eco", action="store_true", default=False,
+        help="Eco mode: skip scenes that already have 100 frames, "
+             "and only regenerate missing frames in incomplete scenes",
+    )
     args = parser.parse_args()
+
+    EXPECTED_FRAMES = 100
 
     # Find all scene files
     h5_files = sorted(glob.glob(os.path.join(args.data_dir, "scene_*.h5")))
@@ -210,33 +279,70 @@ def main():
 
     print(f"Found {len(h5_files)} scene files in {args.data_dir}")
     print(f"Output directory: {args.out_dir}")
+    if args.eco:
+        print(f"ECO MODE enabled — expecting {EXPECTED_FRAMES} frames per scene")
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
     # Process each scene
     all_manifest_rows = []
-    for fpath in h5_files:
-        rows = process_scene(fpath, args.out_dir)
-        all_manifest_rows.extend(rows)
 
-    # Write manifest CSV
+    for fpath in h5_files:
+        scene_name = Path(fpath).stem
+
+        if args.eco:
+            existing = count_existing_npz(args.out_dir, scene_name)
+            n_existing = len(existing)
+
+            if n_existing >= EXPECTED_FRAMES:
+                print(f"\n{'='*60}")
+                print(f"ECO SKIP: {scene_name} — {n_existing} frames already present ✓")
+                # Rebuild manifest entries from existing .npz files
+                rows = collect_existing_manifest_rows(
+                    args.out_dir, scene_name, existing
+                )
+                all_manifest_rows.extend(rows)
+                continue
+            else:
+                print(f"\n{'='*60}")
+                print(f"ECO PARTIAL: {scene_name} — {n_existing}/{EXPECTED_FRAMES} "
+                      f"frames found, regenerating {EXPECTED_FRAMES - n_existing} missing")
+                # Process only the missing frames
+                rows = process_scene(fpath, args.out_dir, skip_indices=existing)
+                # Also collect manifest rows for existing frames
+                existing_rows = collect_existing_manifest_rows(
+                    args.out_dir, scene_name, existing
+                )
+                all_manifest_rows.extend(existing_rows)
+                all_manifest_rows.extend(rows)
+        else:
+            rows = process_scene(fpath, args.out_dir)
+            all_manifest_rows.extend(rows)
+
+    # Write manifest CSV (sorted for consistency)
     manifest_df = pd.DataFrame(all_manifest_rows)
+    manifest_df = manifest_df.sort_values(
+        ["scene", "pose_index"]
+    ).reset_index(drop=True)
     manifest_path = Path(args.out_dir) / "manifest.csv"
     manifest_df.to_csv(manifest_path, index=False)
 
     # Summary
     print(f"\n{'='*60}")
-    print(f"DONE — {len(manifest_df)} frames preprocessed")
+    print(f"DONE — {len(manifest_df)} frames in manifest")
     print(f"Manifest: {manifest_path}")
     print(f"\nPer-scene breakdown:")
     print(manifest_df.groupby("scene")["num_points_valid"].agg(["count", "sum", "mean"])
           .rename(columns={"count": "frames", "sum": "total_pts", "mean": "avg_pts"})
           .to_string(float_format="%.0f"))
 
-    total_dropped = manifest_df["num_invalid_dropped"].sum()
-    total_raw = manifest_df["num_points_raw"].sum()
-    print(f"\nInvalid beams dropped: {total_dropped:,} / {total_raw:,} "
-          f"({100.0 * total_dropped / total_raw:.1f}%)")
+    # Only show drop stats if we have valid raw counts (not -1 from eco skip)
+    has_raw = manifest_df[manifest_df["num_points_raw"] > 0]
+    if len(has_raw) > 0:
+        total_dropped = has_raw["num_invalid_dropped"].sum()
+        total_raw = has_raw["num_points_raw"].sum()
+        print(f"\nInvalid beams dropped (processed frames): {total_dropped:,} / {total_raw:,} "
+              f"({100.0 * total_dropped / total_raw:.1f}%)")
 
 
 if __name__ == "__main__":
