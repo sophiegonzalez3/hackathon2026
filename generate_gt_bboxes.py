@@ -87,10 +87,13 @@ def load_config(config_path=None):
         for section in ("dbscan", "min_cluster_points", "bbox_padding", "merge"):
             if section in user:
                 for cls_name, val in user[section].items():
+                    # Normalize underscores to spaces so YAML keys
+                    # like "Electric_Pole" match code keys "Electric Pole"
+                    canonical = cls_name.replace("_", " ")
                     if isinstance(val, dict):
-                        cfg[section].setdefault(cls_name, {}).update(val)
+                        cfg[section].setdefault(canonical, {}).update(val)
                     else:
-                        cfg[section][cls_name] = val
+                        cfg[section][canonical] = val
         if "output_csv" in user:
             cfg["output_csv"] = user["output_csv"]
 
