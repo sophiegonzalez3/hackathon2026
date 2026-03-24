@@ -1054,3 +1054,299 @@ def qa_report(processed_dir=None, bboxes_csv=None):
         print("  No issues found ✓")
 
     print("\n" + "=" * 70)
+
+
+
+######################## Compare different run of bbox process #################
+
+    """
+Side-by-side comparison of bounding boxes from two different runs.
+
+Drop this into lidar_notebook.py (after plot_side_bboxes) or import it
+directly in your notebook:
+
+    from compare_side_bboxes import compare_side_bboxes
+
+    compare_side_bboxes(
+        "scene_1", 12,
+        bboxes_csv_a="gt_bboxes_v1.csv",
+        bboxes_csv_b="gt_bboxes_v2.csv",
+        label_a="Baseline (eps=3)",
+        label_b="Tuned (eps=5, merged)",
+    )
+"""
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from pathlib import Path
+
+
+# ─── Copy these from lidar_notebook.py (or import them) ──────────────────────
+PROCESSED_DIR = "processed/"
+BBOXES_CSV = "gt_bboxes.csv"
+
+CLASS_COLORS = {
+    "Background":    "#888888",
+    "Antenna":       "#2617B4",
+    "Cable":         "#B1842F",
+    "Electric Pole": "#815161",
+    "Wind Turbine":  "#428409",
+}
+CLASS_ID_TO_LABEL = {0: "Antenna", 1: "Cable", 2: "Electric Pole", 3: "Wind Turbine"}
+CLASS_RGB = {
+    (38, 23, 180):  0,
+    (177, 132, 47): 1,
+    (129, 81, 97):  2,
+    (66, 132, 9):   3,
+}
+BBOX_COLORS = {
+    "Antenna":       "#5B4FFF",
+    "Cable":         "#FFD060",
+    "Electric Pole": "#FF6B8A",
+    "Wind Turbine":  "#40FF40",
+}
+
+
+# ─── Loaders (same as lidar_notebook.py) ─────────────────────────────────────
+def _load_frame(scene, pose_index, processed_dir=None):
+    d = processed_dir or PROCESSED_DIR
+    path = Path(d) / scene / f"frame_{pose_index:03d}.npz"
+    if not path.exists():
+        raise FileNotFoundError(f"Frame not found: {path}")
+    data = np.load(path)
+    xyz = data["xyz"]
+    rgb = data["rgb"]
+    class_ids = np.full(len(rgb), -1, dtype=np.int32)
+    for (r, g, b), cid in CLASS_RGB.items():
+        mask = (rgb[:, 0] == r) & (rgb[:, 1] == g) & (rgb[:, 2] == b)
+        class_ids[mask] = cid
+    class_labels = ["Background" if c == -1 else CLASS_ID_TO_LABEL[c] for c in class_ids]
+    return xyz, class_ids, class_labels
+
+
+def _load_bboxes(scene, pose_index, bboxes_csv):
+    df = pd.read_csv(bboxes_csv)
+    df = df[(df["scene"] == scene) & (df["pose_index"] == pose_index)]
+    return df.reset_index(drop=True)
+
+
+def _subsample(xyz, class_labels, max_points):
+    if len(xyz) <= max_points:
+        return xyz, class_labels
+    idx = np.random.choice(len(xyz), max_points, replace=False)
+    idx.sort()
+    return xyz[idx], [class_labels[i] for i in idx]
+
+
+# ─── Main comparison function ────────────────────────────────────────────────
+def compare_side_bboxes(
+    scene,
+    pose_index,
+    bboxes_csv_a,
+    bboxes_csv_b,
+    label_a="Run A",
+    label_b="Run B",
+    max_points=200_000,
+    point_size=1.5,
+    processed_dir=None,
+    bg_opacity=0.15,
+):
+    """Side-by-side comparison of two bbox runs on the same frame (X-Z view).
+
+    Parameters
+    ----------
+    scene        : str   — scene name, e.g. "scene_1"
+    pose_index   : int   — frame index
+    bboxes_csv_a : str   — path to first bbox CSV
+    bboxes_csv_b : str   — path to second bbox CSV
+    label_a      : str   — display name for first run
+    label_b      : str   — display name for second run
+    max_points   : int   — subsample limit for Plotly performance
+    point_size   : float — marker size
+    processed_dir: str   — path to preprocessed .npz directory
+    bg_opacity   : float — opacity for background points
+    """
+
+    # ── Load shared point cloud ──
+    xyz, cids, clabels = _load_frame(scene, pose_index, processed_dir)
+
+    # ── Load both bbox sets ──
+    bboxes_a = _load_bboxes(scene, pose_index, bboxes_csv_a)
+    bboxes_b = _load_bboxes(scene, pose_index, bboxes_csv_b)
+
+    # ── Subsample (same seed → identical points on both panels) ──
+    rng_state = np.random.get_state()
+    np.random.seed(42)
+    xyz_s, cl_s = _subsample(xyz, clabels, max_points)
+    np.random.set_state(rng_state)
+    cl_arr = np.array(cl_s)
+
+    # ── Build subplots ──
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=[
+            f"{label_a}  ({len(bboxes_a)} objects)",
+            f"{label_b}  ({len(bboxes_b)} objects)",
+        ],
+        shared_yaxes=True,
+        horizontal_spacing=0.04,
+    )
+
+    # ── Helper: add point traces to a subplot column ──
+    def _add_points(col, show_legend):
+        bg = cl_arr == "Background"
+        if bg.any():
+            fig.add_trace(
+                go.Scattergl(
+                    x=xyz_s[bg, 0], y=xyz_s[bg, 2], mode="markers",
+                    marker=dict(size=point_size, color=CLASS_COLORS["Background"],
+                                opacity=bg_opacity),
+                    name=f"Background ({bg.sum():,})",
+                    showlegend=show_legend,
+                    legendgroup="Background",
+                ),
+                row=1, col=col,
+            )
+        for label, color in CLASS_COLORS.items():
+            if label == "Background":
+                continue
+            m = cl_arr == label
+            if m.any():
+                fig.add_trace(
+                    go.Scattergl(
+                        x=xyz_s[m, 0], y=xyz_s[m, 2], mode="markers",
+                        marker=dict(size=point_size + 1, color=color),
+                        name=f"{label} ({m.sum():,})",
+                        showlegend=show_legend,
+                        legendgroup=label,
+                    ),
+                    row=1, col=col,
+                )
+
+    # ── Helper: add bbox rectangles to a subplot column ──
+    def _add_bboxes(bboxes_df, col, show_legend):
+        for _, row in bboxes_df.iterrows():
+            cx, cz = row["bbox_center_x"], row["bbox_center_z"]
+            hw = row["bbox_width"] / 2
+            hh = row["bbox_height"] / 2
+            rx = [cx - hw, cx + hw, cx + hw, cx - hw, cx - hw]
+            rz = [cz - hh, cz - hh, cz + hh, cz + hh, cz - hh]
+            clabel = row["class_label"]
+            color = BBOX_COLORS.get(clabel, "#FFFFFF")
+            fig.add_trace(
+                go.Scattergl(
+                    x=rx, y=rz, mode="lines",
+                    line=dict(color=color, width=2),
+                    showlegend=False,
+                    hovertext=(
+                        f"{clabel}<br>"
+                        f"size: {row['bbox_width']:.1f}×{row['bbox_height']:.1f}m<br>"
+                        f"pts: {row.get('num_points', '?')}"
+                    ),
+                    hoverinfo="text",
+                ),
+                row=1, col=col,
+            )
+
+    # ── Populate both panels ──
+    _add_points(col=1, show_legend=True)
+    _add_bboxes(bboxes_a, col=1, show_legend=False)
+
+    _add_points(col=2, show_legend=False)
+    _add_bboxes(bboxes_b, col=2, show_legend=False)
+
+    # ── Shared axis ranges so both views are perfectly aligned ──
+    x_all = xyz_s[:, 0]
+    z_all = xyz_s[:, 2]
+    x_pad = (x_all.max() - x_all.min()) * 0.02
+    z_pad = (z_all.max() - z_all.min()) * 0.02
+    xrange = [x_all.min() - x_pad, x_all.max() + x_pad]
+    zrange = [z_all.min() - z_pad, z_all.max() + z_pad]
+
+    fig.update_xaxes(range=xrange, title_text="X (m)", row=1, col=1)
+    fig.update_xaxes(range=xrange, title_text="X (m)", row=1, col=2)
+    fig.update_yaxes(range=zrange, title_text="Z (m)", row=1, col=1)
+    fig.update_yaxes(range=zrange, row=1, col=2)
+
+    # ── Summary line ──
+    n_a, n_b = len(bboxes_a), len(bboxes_b)
+    diff = n_b - n_a
+    diff_str = f"+{diff}" if diff >= 0 else str(diff)
+
+    fig.update_layout(
+        title=(
+            f"Side View Comparison — {scene} pose {pose_index}    "
+            f"({label_a}: {n_a} obj  vs  {label_b}: {n_b} obj  [{diff_str}])"
+        ),
+        width=1800,
+        height=500,
+        template="plotly_dark",
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)"),
+    )
+    fig.show()
+
+    # ── Print per-class delta table ──
+    _print_delta_table(bboxes_a, bboxes_b, label_a, label_b)
+
+
+def _print_delta_table(bboxes_a, bboxes_b, label_a, label_b):
+    """Print a compact per-class comparison table."""
+    classes = ["Antenna", "Cable", "Electric Pole", "Wind Turbine"]
+    print(f"\n{'Class':17s} | {label_a:>8s} | {label_b:>8s} | {'Delta':>6s}")
+    print("-" * 50)
+    total_a, total_b = 0, 0
+    for cls in classes:
+        ca = len(bboxes_a[bboxes_a["class_label"] == cls])
+        cb = len(bboxes_b[bboxes_b["class_label"] == cls])
+        d = cb - ca
+        ds = f"+{d}" if d >= 0 else str(d)
+        print(f"{cls:17s} | {ca:8d} | {cb:8d} | {ds:>6s}")
+        total_a += ca
+        total_b += cb
+    d = total_b - total_a
+    ds = f"+{d}" if d >= 0 else str(d)
+    print("-" * 50)
+    print(f"{'TOTAL':17s} | {total_a:8d} | {total_b:8d} | {ds:>6s}")
+
+
+# ─── Batch comparison across many frames ─────────────────────────────────────
+def compare_side_bboxes_batch(
+    bboxes_csv_a,
+    bboxes_csv_b,
+    label_a="Run A",
+    label_b="Run B",
+    n_frames=5,
+    processed_dir=None,
+    **kwargs,
+):
+    """Run the comparison on the N frames with the largest delta in object count.
+
+    Useful to quickly find where the two runs differ most.
+    """
+    df_a = pd.read_csv(bboxes_csv_a)
+    df_b = pd.read_csv(bboxes_csv_b)
+
+    # Count objects per frame in each run
+    counts_a = df_a.groupby(["scene", "pose_index"]).size().rename("n_a")
+    counts_b = df_b.groupby(["scene", "pose_index"]).size().rename("n_b")
+    merged = pd.concat([counts_a, counts_b], axis=1).fillna(0).astype(int)
+    merged["abs_delta"] = (merged["n_b"] - merged["n_a"]).abs()
+    merged = merged.sort_values("abs_delta", ascending=False)
+
+    print(f"Top {n_frames} frames by object-count difference:\n")
+    for i, ((scene, pose), row) in enumerate(merged.head(n_frames).iterrows()):
+        d = row["n_b"] - row["n_a"]
+        ds = f"+{d}" if d >= 0 else str(d)
+        print(f"  {i+1}. {scene} pose {pose:3d}  —  "
+              f"{label_a}: {row['n_a']}  vs  {label_b}: {row['n_b']}  ({ds})")
+        compare_side_bboxes(
+            scene, pose,
+            bboxes_csv_a=bboxes_csv_a,
+            bboxes_csv_b=bboxes_csv_b,
+            label_a=label_a,
+            label_b=label_b,
+            processed_dir=processed_dir,
+            **kwargs,
+        )

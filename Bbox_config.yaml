@@ -1,0 +1,81 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Ground-Truth Bounding Box Generation — Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# Duplicate this file for each experiment, e.g.:
+#   cp bbox_config.yaml configs/run_02_larger_eps.yaml
+#   python generate_gt_bboxes.py --config configs/run_02_larger_eps.yaml
+#
+# The output CSV is auto-named from run_name so you can compare side-by-side.
+
+# ── Run metadata ──────────────────────────────────────────────────────────────
+run_name: "baseline_v1"          # used in output filename: gt_bboxes_<run_name>.csv
+processed_dir: "processed/"      # directory with manifest.csv + per-frame .npz
+output_dir: "gt_runs/"           # all CSVs go here for easy comparison
+verbose: true
+
+# ── Voxel downsampling (speeds up DBSCAN on dense clouds) ────────────────────
+voxel_downsample:
+  max_points_for_dbscan: 15000   # downsample if class has more points than this
+  voxel_size: 0.3                # meters — smaller = more points kept
+
+# ── DBSCAN clustering parameters (per class) ─────────────────────────────────
+# eps:         max distance (m) between two points to be in the same neighborhood
+# min_samples: min neighbors for a point to be a "core" point
+#
+# Rule of thumb:
+#   - Increase eps  → fewer, larger clusters (less fragmentation)
+#   - Decrease min_samples → peripheral/sparse points stay in cluster
+dbscan:
+  Antenna:
+    eps: 5.0             # was 3.0 — antennas are large, well-separated
+    min_samples: 10      # was 20  — sparse far-range points were lost
+  Cable:
+    eps: 8.0             # was 5.0 — cables are long and thin, need bridging
+    min_samples: 5       # was 10  — cables are inherently sparse
+  Electric_Pole:
+    eps: 4.0             # was 2.0 — poles can be tall, density varies with range
+    min_samples: 10      # was 20  — far poles had too few core points
+  Wind_Turbine:
+    eps: 8.0             # was 5.0 — turbines are huge objects
+    min_samples: 15      # was 30  — blade tips are very sparse
+
+# ── Minimum points to keep a cluster as a valid detection ─────────────────────
+# Below this threshold the cluster is discarded as noise.
+min_cluster_points:
+  Antenna: 8             # was 15
+  Cable: 5               # was 10
+  Electric_Pole: 8       # was 15
+  Wind_Turbine: 15       # was 30
+
+# ── Reassignment radius multiplier ───────────────────────────────────────────
+# After downsampled DBSCAN, original points within (multiplier × eps) of
+# their nearest cluster center are assigned back to that cluster.
+# Higher = fuller bboxes but risk pulling in far-away noise.
+reassign_radius_multiplier: 3.0  # was 2.0
+
+# ── Bounding box padding (meters, added to each side) ────────────────────────
+# LiDAR only sees the surface facing the sensor, so min/max extents
+# systematically underestimate the true object size.  A small pad helps.
+bbox_padding:
+  Antenna: 0.5
+  Cable: 0.3
+  Electric_Pole: 0.5
+  Wind_Turbine: 1.0
+
+# ── Post-clustering merge (for classes where objects are far apart) ───────────
+# If two clusters of the same class have centers closer than merge_distance,
+# they are merged and a single bbox is re-fit on the combined points.
+# Set enabled: false to skip merging for a class.
+merge:
+  Antenna:
+    enabled: true
+    merge_distance: 20.0     # meters — two antennas are never this close
+  Cable:
+    enabled: false           # cables CAN be close (parallel lines)
+    merge_distance: 0.0
+  Electric_Pole:
+    enabled: true
+    merge_distance: 10.0     # poles are typically well-separated
+  Wind_Turbine:
+    enabled: true
+    merge_distance: 50.0     # turbines are hundreds of meters apart
