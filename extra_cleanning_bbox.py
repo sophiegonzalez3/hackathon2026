@@ -42,7 +42,7 @@ DEFAULT_MAX_DIM = {
     "Antenna":       180,
     "Cable":        150,   # cables can be long
     "Electric Pole": 80,
-    "Wind Turbine": 120,
+    "Wind Turbine": 170,
 }
 
 # Min volume (m³) — tiny padding-only boxes
@@ -58,7 +58,7 @@ DEFAULT_MAX_ASPECT = {
     "Antenna":       30,
     "Cable":        500,   # cables are extremely elongated by nature
     "Electric Pole": 30,
-    "Wind Turbine":  20,
+    "Wind Turbine":  30,
 }
 
 
