@@ -18,13 +18,8 @@ Usage:
     # Override output path
     python generate_gt_bboxes.py --config bbox_config_v2.yaml --out my_bboxes.csv
 
-    # Visualize one frame (requires open3d)
-    python generate_gt_bboxes.py --config bbox_config_v2.yaml \\
-        --viz scene_1 --viz-pose 0
-
 Requirements:
     pip install numpy pandas scikit-learn scipy pyyaml
-    pip install open3d   (optional, for --viz)
 """
 
 import argparse
@@ -45,6 +40,9 @@ from sklearn.cluster import DBSCAN
 
 _DEFAULT_CONFIG = {
     "processed_dir": "processed/",
+    "output_dir": ".",
+    "run_name": None,
+    "verbose": True,
     "max_points_for_dbscan": 15_000,
     "voxel_size": 0.3,
     "dbscan": {
@@ -80,10 +78,28 @@ def load_config(config_path=None):
             return cfg
         with open(p) as f:
             user = yaml.safe_load(f) or {}
-        for key in ("processed_dir", "max_points_for_dbscan", "voxel_size",
-                     "reassign_radius_multiplier"):
+
+        # ── Top-level scalars ─────────────────────────────────────────
+        for key in ("processed_dir", "reassign_radius_multiplier",
+                     "output_dir", "run_name", "verbose"):
             if key in user:
                 cfg[key] = user[key]
+
+        # ── Flat top-level keys (backward compat) ────────────────────
+        if "max_points_for_dbscan" in user:
+            cfg["max_points_for_dbscan"] = user["max_points_for_dbscan"]
+        if "voxel_size" in user:
+            cfg["voxel_size"] = user["voxel_size"]
+
+        # ── Nested voxel_downsample section (preferred YAML layout) ──
+        if "voxel_downsample" in user:
+            vd = user["voxel_downsample"]
+            if "max_points_for_dbscan" in vd:
+                cfg["max_points_for_dbscan"] = vd["max_points_for_dbscan"]
+            if "voxel_size" in vd:
+                cfg["voxel_size"] = vd["voxel_size"]
+
+        # ── Per-class dict sections ──────────────────────────────────
         for section in ("dbscan", "min_cluster_points", "bbox_padding", "merge"):
             if section in user:
                 for cls_name, val in user[section].items():
@@ -94,29 +110,50 @@ def load_config(config_path=None):
                         cfg[section].setdefault(canonical, {}).update(val)
                     else:
                         cfg[section][canonical] = val
+
         if "output_csv" in user:
             cfg["output_csv"] = user["output_csv"]
 
     return cfg
 
 
-def derive_output_csv(config_path):
-    """bbox_config_v2.yaml -> gt_bboxes_v2.csv"""
-    if config_path is None:
-        return "gt_bboxes.csv"
-    stem = Path(config_path).stem
-    tag = stem.replace("bbox_config_", "").replace("bbox_config", "default")
-    if not tag:
-        tag = "default"
-    return f"gt_bboxes_{tag}.csv"
+def derive_output_csv(cfg, config_path):
+    """Build the output CSV path from run_name / output_dir / config filename.
+
+    Priority:
+      1. cfg["output_csv"]  (explicit override in YAML)
+      2. output_dir / gt_bboxes_<run_name>.csv
+      3. output_dir / gt_bboxes_<config_stem_tag>.csv
+      4. gt_bboxes.csv  (fallback)
+    """
+    output_dir = Path(cfg.get("output_dir", "."))
+
+    if "output_csv" in cfg:
+        return str(output_dir / cfg["output_csv"])
+
+    run_name = cfg.get("run_name")
+    if run_name:
+        return str(output_dir / f"gt_bboxes_{run_name}.csv")
+
+    if config_path is not None:
+        stem = Path(config_path).stem
+        tag = stem.replace("bbox_config_", "").replace("bbox_config", "default")
+        if not tag:
+            tag = "default"
+        return str(output_dir / f"gt_bboxes_{tag}.csv")
+
+    return str(output_dir / "gt_bboxes.csv")
 
 
 def print_config(cfg, config_path):
     """Pretty-print the active config for reproducibility."""
     print(f"\n{'─'*60}")
     print(f"  CONFIG: {config_path or 'built-in defaults'}")
+    if cfg.get("run_name"):
+        print(f"  run_name                 : {cfg['run_name']}")
     print(f"{'─'*60}")
     print(f"  processed_dir            : {cfg['processed_dir']}")
+    print(f"  output_dir               : {cfg.get('output_dir', '.')}")
     print(f"  max_points_for_dbscan    : {cfg['max_points_for_dbscan']:,}")
     print(f"  voxel_size               : {cfg['voxel_size']}")
     print(f"  reassign_radius_multiplier: {cfg['reassign_radius_multiplier']}")
@@ -327,7 +364,7 @@ def extract_bboxes(xyz, rgb, cfg, verbose=False, frame_label=""):
             n_noise = (cluster_labels == -1).sum()
             print(f"{n_clusters} clusters, {n_noise} noise  [{dt:.2f}s]")
 
-        # ── Merge nearby clusters before fitting bboxes ───────────────────
+        # ── Merge nearby clusters before fitting bboxes ───────────────
         if merge_cfg["enabled"] and merge_cfg["merge_distance"] > 0 and n_clusters > 1:
             old_n = n_clusters
             cluster_labels = merge_cluster_labels(
@@ -338,7 +375,7 @@ def extract_bboxes(xyz, rgb, cfg, verbose=False, frame_label=""):
                 print(f"        -> merged {old_n} -> {n_clusters} clusters "
                       f"(dist < {merge_cfg['merge_distance']}m)")
 
-        # ── Reassign original points after downsampled clustering ─────────
+        # ── Reassign original points after downsampled clustering ─────
         if downsampled and n_clusters > 0:
             cluster_centers = {}
             for c_id in set(cluster_labels) - {-1}:
@@ -452,6 +489,10 @@ def process_all(cfg, output_csv, verbose=True):
         print("Check DBSCAN params — eps might be too small or min_samples too high.")
         sys.exit(1)
 
+    # ── Ensure output directory exists ────────────────────────────────
+    out_path = Path(output_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
     df_out = pd.DataFrame(all_bboxes)
     df_out = df_out.rename(columns={
         "center_x": "bbox_center_x", "center_y": "bbox_center_y",
@@ -500,9 +541,7 @@ def main():
     parser.add_argument("--processed-dir", default=None,
                         help="Override config's processed_dir")
     parser.add_argument("--out", default=None,
-                        help="Output CSV path (default: auto-derived from config name)")
-    parser.add_argument("--viz-pose", type=int, default=0,
-                        help="Pose index to visualize (default: 0)")
+                        help="Output CSV path (default: auto-derived from run_name/config)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress per-frame output")
     args = parser.parse_args()
@@ -513,14 +552,15 @@ def main():
 
     if args.out:
         output_csv = args.out
-    elif "output_csv" in cfg:
-        output_csv = cfg["output_csv"]
     else:
-        output_csv = derive_output_csv(args.config)
+        output_csv = derive_output_csv(cfg, args.config)
+
+    # Verbosity: CLI -q wins, otherwise use config value
+    verbose = (not args.quiet) and cfg.get("verbose", True)
 
     print_config(cfg, args.config)
 
-    df = process_all(cfg, output_csv, verbose=not args.quiet)
+    df = process_all(cfg, output_csv, verbose=verbose)
     return df
 
 
