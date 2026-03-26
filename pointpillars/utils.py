@@ -5,7 +5,6 @@ Pillarization, Gaussian target generation, CenterNet-style decoding & NMS.
 """
 
 import numpy as np
-import torch
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -15,6 +14,7 @@ import torch
 def pillarize(points, cfg):
     """
     Convert raw points (N, 4) → pillar tensors for the model.
+    Fully vectorized — no Python loops over pillars.
 
     Args:
         points: (N, 4) — [x, y, z, reflectivity]
@@ -41,84 +41,98 @@ def pillarize(points, cfg):
     points = points[mask]
 
     if len(points) == 0:
-        # Return empty pillars
         return (
             np.zeros((1, max_pts, 9), dtype=np.float32),
             np.zeros((1,), dtype=np.int32),
             np.zeros((1, 2), dtype=np.int32),
         )
 
-    # ── Compute pillar indices ────────────────────────────────────────────
+    # ── Compute pillar grid indices ───────────────────────────────────────
     xi = np.floor((points[:, 0] - x_min) / px).astype(np.int32)
     yi = np.floor((points[:, 1] - y_min) / py).astype(np.int32)
-
-    # Clamp to valid range (safety)
     xi = np.clip(xi, 0, cfg.grid_x - 1)
     yi = np.clip(yi, 0, cfg.grid_y - 1)
 
-    # ── Group points into pillars ─────────────────────────────────────────
-    # Use a flat index for hashing
     flat_idx = xi * cfg.grid_y + yi
 
-    # Find unique pillars
-    unique_flat, inverse = np.unique(flat_idx, return_inverse=True)
+    # ── Sort points by pillar index (groups them together) ────────────────
+    sort_order = np.argsort(flat_idx, kind='mergesort')
+    flat_sorted = flat_idx[sort_order]
+    points_sorted = points[sort_order]
 
-    num_pillars = min(len(unique_flat), max_pillars)
+    # ── Find unique pillars and their boundaries ─────────────────────────
+    unique_flat, starts, counts = np.unique(
+        flat_sorted, return_index=True, return_counts=True
+    )
+    num_pillars = len(unique_flat)
 
-    # If too many pillars, randomly sample
-    if len(unique_flat) > max_pillars:
-        keep = np.random.choice(len(unique_flat), max_pillars, replace=False)
+    # ── Subsample pillars if too many ─────────────────────────────────────
+    if num_pillars > max_pillars:
+        keep = np.random.choice(num_pillars, max_pillars, replace=False)
         keep.sort()
         unique_flat = unique_flat[keep]
-        # Build new inverse mapping
-        keep_set = set(unique_flat)
-        point_mask = np.array([flat_idx[i] in keep_set for i in range(len(flat_idx))])
-        points = points[point_mask]
-        xi = xi[point_mask]
-        yi = yi[point_mask]
-        flat_idx = flat_idx[point_mask]
-        unique_flat, inverse = np.unique(flat_idx, return_inverse=True)
-        num_pillars = len(unique_flat)
+        starts = starts[keep]
+        counts = counts[keep]
+        num_pillars = max_pillars
 
-    # ── Build pillar arrays ───────────────────────────────────────────────
+    # ── Pillar grid coordinates ───────────────────────────────────────────
+    gx = unique_flat // cfg.grid_y
+    gy = unique_flat % cfg.grid_y
+    pillar_coords = np.stack([gx, gy], axis=1).astype(np.int32)
+
+    # Pillar centers in world coordinates
+    center_x = x_min + (gx + 0.5) * px
+    center_y = y_min + (gy + 0.5) * py
+
+    # ── Clamp per-pillar point count ──────────────────────────────────────
+    clamped_counts = np.minimum(counts, max_pts)
+    num_points_per_pillar = clamped_counts.astype(np.int32)
+
+    # ── Build flat arrays of (pillar_idx, position_in_pillar, point_idx) ──
+    total_selected = int(clamped_counts.sum())
+    pillar_ids = np.repeat(np.arange(num_pillars), clamped_counts)
+
+    # Position within each pillar: [0,1,..,c0-1, 0,1,..,c1-1, ...]
+    # Using cumsum trick — zero Python loops
+    cumsum_clamped = np.cumsum(clamped_counts)
+    cumsum_shifted = np.empty(num_pillars, dtype=np.int64)
+    cumsum_shifted[0] = 0
+    cumsum_shifted[1:] = cumsum_clamped[:-1]
+    repeated_shifts = np.repeat(cumsum_shifted, clamped_counts)
+    pos_in_pillar = (np.arange(total_selected) - repeated_shifts).astype(np.int32)
+
+    # Global point indices in points_sorted: [s0+0, s0+1, .., s1+0, s1+1, ..]
+    repeated_starts = np.repeat(starts, clamped_counts)
+    global_pt_idx = (repeated_starts + pos_in_pillar).astype(np.int64)
+
+    # ── Gather selected points ────────────────────────────────────────────
+    sel_pts = points_sorted[global_pt_idx]  # (total_selected, 4)
+
+    # ── Compute per-pillar mean XYZ (vectorized) ─────────────────────────
+    # Sum xyz per pillar, then divide by count
+    pillar_sum_xyz = np.zeros((num_pillars, 3), dtype=np.float64)
+    np.add.at(pillar_sum_xyz, pillar_ids, sel_pts[:, :3])
+    pillar_mean_xyz = pillar_sum_xyz / np.maximum(clamped_counts, 1)[:, None]
+
+    # Broadcast mean back to each point
+    mean_per_point = pillar_mean_xyz[pillar_ids]  # (total_selected, 3)
+
+    # Broadcast center back to each point
+    cx_per_point = center_x[pillar_ids]  # (total_selected,)
+    cy_per_point = center_y[pillar_ids]  # (total_selected,)
+
+    # ── Build the 9-feature vector for each selected point ───────────────
+    features_9 = np.zeros((total_selected, 9), dtype=np.float32)
+    features_9[:, :4] = sel_pts                                # x, y, z, r
+    features_9[:, 4] = sel_pts[:, 0] - mean_per_point[:, 0]   # x_c
+    features_9[:, 5] = sel_pts[:, 1] - mean_per_point[:, 1]   # y_c
+    features_9[:, 6] = sel_pts[:, 2] - mean_per_point[:, 2]   # z_c
+    features_9[:, 7] = sel_pts[:, 0] - cx_per_point            # x_p
+    features_9[:, 8] = sel_pts[:, 1] - cy_per_point            # y_p
+
+    # ── Scatter into (P, max_pts, 9) output array ─────────────────────────
     pillar_features = np.zeros((num_pillars, max_pts, 9), dtype=np.float32)
-    num_points_per_pillar = np.zeros(num_pillars, dtype=np.int32)
-    pillar_coords = np.zeros((num_pillars, 2), dtype=np.int32)
-
-    for p_idx in range(num_pillars):
-        flat_val = unique_flat[p_idx]
-        point_mask = flat_idx == flat_val
-        pts = points[point_mask]
-
-        # Pillar grid center in world coords
-        gx = flat_val // cfg.grid_y
-        gy = flat_val % cfg.grid_y
-        center_x = x_min + (gx + 0.5) * px
-        center_y = y_min + (gy + 0.5) * py
-
-        pillar_coords[p_idx] = [gx, gy]
-
-        # Subsample if too many points
-        n = len(pts)
-        if n > max_pts:
-            choice = np.random.choice(n, max_pts, replace=False)
-            pts = pts[choice]
-            n = max_pts
-
-        num_points_per_pillar[p_idx] = n
-
-        # Raw features: x, y, z, reflectivity
-        pillar_features[p_idx, :n, :4] = pts[:, :4]
-
-        # Offset from pillar mean
-        mean_xyz = pts[:, :3].mean(axis=0)
-        pillar_features[p_idx, :n, 4] = pts[:, 0] - mean_xyz[0]  # x_c
-        pillar_features[p_idx, :n, 5] = pts[:, 1] - mean_xyz[1]  # y_c
-        pillar_features[p_idx, :n, 6] = pts[:, 2] - mean_xyz[2]  # z_c
-
-        # Offset from pillar grid center
-        pillar_features[p_idx, :n, 7] = pts[:, 0] - center_x     # x_p
-        pillar_features[p_idx, :n, 8] = pts[:, 1] - center_y     # y_p
+    pillar_features[pillar_ids, pos_in_pillar] = features_9
 
     return pillar_features, num_points_per_pillar, pillar_coords
 
@@ -283,6 +297,7 @@ def generate_targets(gt_boxes, cfg):
 
 def nms_heatmap(heatmap, kernel=3):
     """Simple max-pool NMS on heatmap."""
+    import torch
     pad = (kernel - 1) // 2
     hmax = torch.nn.functional.max_pool2d(
         heatmap, kernel_size=kernel, stride=1, padding=pad

@@ -270,7 +270,7 @@ def consolidate_scene(scene_dir, voxel_size=0.5, with_labels=False, verbose=True
 # PROCESS ALL SCENES
 # ─────────────────────────────────────────────────────────────
 def process_all_scenes(npz_root, output_dir, voxel_size=0.5,
-                       with_labels=False, verbose=True):
+                       with_labels=False, verbose=True, force=False):
     npz_root = Path(npz_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -283,6 +283,11 @@ def process_all_scenes(npz_root, output_dir, voxel_size=0.5,
     print(f"Found {len(scene_dirs)} scenes | voxel={voxel_size}m | labels={'Y' if with_labels else 'N'}")
 
     for scene_dir in scene_dirs:
+        out_path = output_dir / f'{scene_dir.name}_voxels.csv'
+        if out_path.exists() and not force:
+            print(f"  SKIP {scene_dir.name}: {out_path.name} already exists (use --force to overwrite)")
+            continue
+
         t0 = time.time()
         grid = consolidate_scene(scene_dir, voxel_size, with_labels, verbose)
         df = grid.to_dataframe(with_labels=with_labels)
@@ -307,9 +312,11 @@ def main():
     parser.add_argument('--output-dir', default='consolidated/')
     parser.add_argument('--voxel-size', type=float, default=0.5)
     parser.add_argument('--with-labels', action='store_true')
+    parser.add_argument('--force', action='store_true',
+                        help='Overwrite existing consolidated files')
     args = parser.parse_args()
     process_all_scenes(args.npz_root, args.output_dir, args.voxel_size,
-                       args.with_labels, verbose=True)
+                       args.with_labels, verbose=True, force=args.force)
 
 
 if __name__ == '__main__':
