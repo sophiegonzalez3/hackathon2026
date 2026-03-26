@@ -1,33 +1,16 @@
 """
-consolidate_scene.py — Multi-frame scene consolidation
-=======================================================
-For each scene, loads all 100 frames, transforms points from local (ego)
-frame to a shared world frame, and accumulates them into a voxel grid.
-
-Each voxel stores rich features:
-  - hit_count         : how many points landed here across all frames
-  - frame_count       : how many different frames observed this voxel
-  - mean_reflectivity : average reflectivity
-  - std_reflectivity  : reflectivity variance
-  - z_min, z_max      : vertical extent of points in this voxel
-  - z_mean, z_std     : vertical statistics
-  - mean_elevation    : average elevation angle from ego (indicates "looking up")
-
-For TRAINING only (RGB available):
-  - class_votes       : per-class point counts (for majority-vote labeling)
+consolidate_scene.py — Multi-frame scene consolidation (v2 — memory efficient)
+================================================================================
+Accumulates all frames into a voxel grid using RUNNING STATISTICS only.
+No raw point lists are stored — O(1) memory per voxel regardless of hit count.
 
 Usage:
-    # Training (with labels)
     python consolidate_scene.py --npz-root processed/ --output-dir consolidated/ --with-labels
-
-    # Inference (no labels)
-    python consolidate_scene.py --npz-root eval_data/ --output-dir consolidated_eval/
 """
 
 import argparse
 import time
 from pathlib import Path
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -36,12 +19,11 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
-# RGB class mapping
 CLASS_RGB = {
-    (38, 23, 180):  0,  # Antenna
-    (177, 132, 47): 1,  # Cable
-    (129, 81, 97):  2,  # Electric Pole
-    (66, 132, 9):   3,  # Wind Turbine
+    (38, 23, 180):  0,
+    (177, 132, 47): 1,
+    (129, 81, 97):  2,
+    (66, 132, 9):   3,
 }
 CLASS_NAMES = ['Antenna', 'Cable', 'Electric Pole', 'Wind Turbine']
 N_CLASSES = 4
@@ -53,243 +35,192 @@ BACKGROUND_ID = -1
 # ─────────────────────────────────────────────────────────────
 def local_to_world(xyz_local, ego_pose):
     """
-    Transform points from local (ego/lidar) frame to world frame.
-
-    Args:
-        xyz_local: (N, 3) points in local frame (meters, ego at origin)
-        ego_pose: (4,) array [ego_x, ego_y, ego_z, ego_yaw] in RAW units
-                  (centimeters for position, hundredths of degrees for yaw)
-
-    Returns:
-        xyz_world: (N, 3) points in world frame (meters)
-    """
-    # Convert raw units
-    tx = ego_pose[0] / 100.0   # cm -> m
-    ty = ego_pose[1] / 100.0
-    tz = ego_pose[2] / 100.0
-    yaw = np.radians(ego_pose[3])  #already in degree!!
-
-    # Rotation around Z axis
-    c, s = np.cos(yaw), np.sin(yaw)
-
-    # Rotate then translate
-    x_world = xyz_local[:, 0] * c - xyz_local[:, 1] * s + tx
-    y_world = xyz_local[:, 0] * s + xyz_local[:, 1] * c + ty
-    z_world = xyz_local[:, 2] + tz
-
-    return np.column_stack([x_world, y_world, z_world]).astype(np.float32)
-
-
-def world_to_local(xyz_world, ego_pose):
-    """
-    Transform points from world frame back to local (ego) frame.
-    Inverse of local_to_world.
+    Transform local frame → world frame.
+    ego_pose: [ego_x(cm), ego_y(cm), ego_z(cm), ego_yaw(degrees)]
     """
     tx = ego_pose[0] / 100.0
     ty = ego_pose[1] / 100.0
     tz = ego_pose[2] / 100.0
-    yaw = np.radians(ego_pose[3] / 100.0)
+    yaw = np.radians(ego_pose[3])  # already degrees
 
-    # Translate then rotate by -yaw
+    c, s = np.cos(yaw), np.sin(yaw)
+    x_w = xyz_local[:, 0] * c - xyz_local[:, 1] * s + tx
+    y_w = xyz_local[:, 0] * s + xyz_local[:, 1] * c + ty
+    z_w = xyz_local[:, 2] + tz
+    return np.column_stack([x_w, y_w, z_w]).astype(np.float32)
+
+
+def world_to_local(xyz_world, ego_pose):
+    """Inverse of local_to_world."""
+    tx = ego_pose[0] / 100.0
+    ty = ego_pose[1] / 100.0
+    tz = ego_pose[2] / 100.0
+    yaw = np.radians(ego_pose[3])
+
     dx = xyz_world[:, 0] - tx
     dy = xyz_world[:, 1] - ty
     dz = xyz_world[:, 2] - tz
 
     c, s = np.cos(-yaw), np.sin(-yaw)
-    x_local = dx * c - dy * s
-    y_local = dx * s + dy * c
-    z_local = dz
-
-    return np.column_stack([x_local, y_local, z_local]).astype(np.float32)
+    return np.column_stack([dx*c - dy*s, dx*s + dy*c, dz]).astype(np.float32)
 
 
 # ─────────────────────────────────────────────────────────────
-# VOXEL GRID
+# VOXEL GRID — RUNNING STATS ONLY, ~112 bytes per voxel
 # ─────────────────────────────────────────────────────────────
+# Layout of the float64[14] array per voxel:
+_H    = 0   # hit_count
+_FC   = 1   # frame_count (updated once per frame via set tracking)
+_RS   = 2   # ref_sum
+_RSQ  = 3   # ref_sq_sum
+_ZMIN = 4   # z_min
+_ZMAX = 5   # z_max
+_ZS   = 6   # z_sum
+_ZSQ  = 7   # z_sq_sum
+_EL   = 8   # elev_sum
+_V0   = 9   # class_votes[0..3]
+_BG   = 13  # bg_count
+_NFIELDS = 14
+
+
 class VoxelGrid:
-    """
-    Sparse voxel grid that accumulates points from multiple frames.
-
-    Uses a dictionary keyed by (ix, iy, iz) voxel indices for memory
-    efficiency — only occupied voxels are stored.
-    """
+    """Sparse voxel grid with O(1) memory per voxel."""
 
     def __init__(self, voxel_size=0.5):
         self.voxel_size = voxel_size
-        self.voxels = {}  # (ix, iy, iz) -> VoxelData
+        self.voxels = {}       # (ix,iy,iz) -> float64[14]
+        self._frame_sets = {}  # (ix,iy,iz) -> set(frame_ids)
 
-    def _to_index(self, xyz):
-        """Convert (N, 3) world coords to (N, 3) integer voxel indices."""
-        return np.floor(xyz / self.voxel_size).astype(np.int32)
-
-    def accumulate(self, xyz_world, reflectivity, frame_id,
-                   class_ids=None, elevation_angles=None):
-        """
-        Add points from one frame into the voxel grid.
-
-        Args:
-            xyz_world: (N, 3) world-frame coordinates
-            reflectivity: (N,) uint8 reflectivity values
-            frame_id: int, unique frame identifier
-            class_ids: (N,) int, per-point class labels (-1=background). Training only.
-            elevation_angles: (N,) float, elevation angle from ego. Optional.
-        """
-        indices = self._to_index(xyz_world)
-
-        for i in range(len(xyz_world)):
-            key = (int(indices[i, 0]), int(indices[i, 1]), int(indices[i, 2]))
-
-            if key not in self.voxels:
-                self.voxels[key] = {
-                    'hit_count': 0,
-                    'frame_ids': set(),
-                    'ref_sum': 0.0,
-                    'ref_sq_sum': 0.0,
-                    'z_values': [],
-                    'elev_sum': 0.0,
-                    'class_votes': np.zeros(N_CLASSES, dtype=np.int32),
-                    'bg_count': 0,
-                }
-
-            v = self.voxels[key]
-            v['hit_count'] += 1
-            v['frame_ids'].add(frame_id)
-
-            ref_val = float(reflectivity[i])
-            v['ref_sum'] += ref_val
-            v['ref_sq_sum'] += ref_val * ref_val
-
-            v['z_values'].append(float(xyz_world[i, 2]))
-
-            if elevation_angles is not None:
-                v['elev_sum'] += float(elevation_angles[i])
-
-            if class_ids is not None:
-                cid = int(class_ids[i])
-                if 0 <= cid < N_CLASSES:
-                    v['class_votes'][cid] += 1
-                else:
-                    v['bg_count'] += 1
+    def _new_voxel(self):
+        v = np.zeros(_NFIELDS, dtype=np.float64)
+        v[_ZMIN] = 1e30
+        v[_ZMAX] = -1e30
+        return v
 
     def accumulate_batch(self, xyz_world, reflectivity, frame_id,
                          class_ids=None, elevation_angles=None):
-        """
-        Vectorized batch accumulation — much faster than per-point loop.
-        Groups points by voxel index first, then updates each voxel once.
-        """
-        indices = self._to_index(xyz_world)
+        """Accumulate one frame into the grid. Groups by voxel first."""
+        indices = np.floor(xyz_world / self.voxel_size).astype(np.int32)
         n = len(xyz_world)
 
-        # Build a dict of point indices per voxel
-        voxel_groups = defaultdict(list)
-        for i in range(n):
-            key = (int(indices[i, 0]), int(indices[i, 1]), int(indices[i, 2]))
-            voxel_groups[key].append(i)
+        # Group points by voxel using pandas for speed
+        # Pack 3 ints into a single int64 key
+        keys = (indices[:, 0].astype(np.int64) * 2_000_003 +
+                indices[:, 1].astype(np.int64)) * 2_000_003 + indices[:, 2].astype(np.int64)
 
-        for key, pt_indices in voxel_groups.items():
-            pt_indices = np.array(pt_indices)
+        order = np.argsort(keys)
+        keys_sorted = keys[order]
+
+        # Find group boundaries
+        breaks = np.where(np.diff(keys_sorted) != 0)[0] + 1
+        groups = np.split(order, breaks)
+
+        ref_f64 = reflectivity.astype(np.float64)
+        z_f64 = xyz_world[:, 2].astype(np.float64)
+
+        for grp in groups:
+            i0 = grp[0]
+            ix, iy, iz = int(indices[i0, 0]), int(indices[i0, 1]), int(indices[i0, 2])
+            key = (ix, iy, iz)
 
             if key not in self.voxels:
-                self.voxels[key] = {
-                    'hit_count': 0,
-                    'frame_ids': set(),
-                    'ref_sum': 0.0,
-                    'ref_sq_sum': 0.0,
-                    'z_values': [],
-                    'elev_sum': 0.0,
-                    'class_votes': np.zeros(N_CLASSES, dtype=np.int32),
-                    'bg_count': 0,
-                }
+                self.voxels[key] = self._new_voxel()
+                self._frame_sets[key] = set()
 
             v = self.voxels[key]
-            count = len(pt_indices)
-            v['hit_count'] += count
-            v['frame_ids'].add(frame_id)
+            count = len(grp)
 
-            refs = reflectivity[pt_indices].astype(np.float64)
-            v['ref_sum'] += refs.sum()
-            v['ref_sq_sum'] += (refs * refs).sum()
+            v[_H] += count
+            self._frame_sets[key].add(frame_id)
 
-            zs = xyz_world[pt_indices, 2].tolist()
-            v['z_values'].extend(zs)
+            r = ref_f64[grp]
+            v[_RS] += r.sum()
+            v[_RSQ] += (r * r).sum()
+
+            z = z_f64[grp]
+            v[_ZMIN] = min(v[_ZMIN], z.min())
+            v[_ZMAX] = max(v[_ZMAX], z.max())
+            v[_ZS] += z.sum()
+            v[_ZSQ] += (z * z).sum()
 
             if elevation_angles is not None:
-                v['elev_sum'] += float(elevation_angles[pt_indices].sum())
+                v[_EL] += elevation_angles[grp].sum()
 
             if class_ids is not None:
-                cids = class_ids[pt_indices]
+                cids = class_ids[grp]
                 for c in range(N_CLASSES):
-                    v['class_votes'][c] += int((cids == c).sum())
-                v['bg_count'] += int((cids < 0).sum() + (cids >= N_CLASSES).sum())
+                    v[_V0 + c] += (cids == c).sum()
+                v[_BG] += ((cids < 0) | (cids >= N_CLASSES)).sum()
 
     def to_dataframe(self, with_labels=False):
-        """
-        Convert the sparse voxel grid to a DataFrame with computed features.
+        """Convert to DataFrame — fully vectorized, no per-voxel loops."""
+        nv = len(self.voxels)
+        if nv == 0:
+            return pd.DataFrame()
 
-        Returns one row per occupied voxel.
-        """
-        rows = []
-        for (ix, iy, iz), v in self.voxels.items():
-            n = v['hit_count']
-            if n == 0:
-                continue
+        print(f"    Building DataFrame from {nv:,} voxels...", end=" ", flush=True)
+        t0 = time.time()
 
-            zs = np.array(v['z_values'])
-            ref_mean = v['ref_sum'] / n
-            ref_var = max(0, v['ref_sq_sum'] / n - ref_mean ** 2)
+        # Dump everything into arrays
+        keys_arr = np.array(list(self.voxels.keys()), dtype=np.int32)   # (nv, 3)
+        data = np.array(list(self.voxels.values()), dtype=np.float64)   # (nv, 14)
+        fc = np.array([len(self._frame_sets[k]) for k in self.voxels], dtype=np.int32)
 
-            row = {
-                'vx': ix, 'vy': iy, 'vz': iz,
-                # World position (voxel center)
-                'world_x': (ix + 0.5) * self.voxel_size,
-                'world_y': (iy + 0.5) * self.voxel_size,
-                'world_z': (iz + 0.5) * self.voxel_size,
-                # Accumulation features
-                'hit_count': n,
-                'frame_count': len(v['frame_ids']),
-                'observation_ratio': len(v['frame_ids']) / 100.0,  # fraction of frames
-                # Reflectivity
-                'ref_mean': ref_mean,
-                'ref_std': np.sqrt(ref_var),
-                # Vertical stats
-                'z_min': zs.min(),
-                'z_max': zs.max(),
-                'z_range': zs.max() - zs.min(),
-                'z_mean': zs.mean(),
-                'z_std': zs.std() if len(zs) > 1 else 0.0,
-                # Elevation
-                'elev_mean': v['elev_sum'] / n if n > 0 else 0.0,
-            }
+        vs = self.voxel_size
+        hits = np.maximum(data[:, _H], 1)
 
-            if with_labels:
-                votes = v['class_votes']
-                total_obstacle = votes.sum()
-                bg = v['bg_count']
+        ref_mean = data[:, _RS] / hits
+        ref_var = np.maximum(0, data[:, _RSQ] / hits - ref_mean**2)
+        z_mean = data[:, _ZS] / hits
+        z_var = np.maximum(0, data[:, _ZSQ] / hits - z_mean**2)
 
-                if total_obstacle > 0:
-                    row['class_id'] = int(np.argmax(votes))
-                    row['class_confidence'] = float(votes.max()) / float(total_obstacle)
-                    row['is_obstacle'] = True
-                else:
-                    row['class_id'] = BACKGROUND_ID
-                    row['class_confidence'] = 1.0
-                    row['is_obstacle'] = False
+        result = {
+            'vx': keys_arr[:, 0], 'vy': keys_arr[:, 1], 'vz': keys_arr[:, 2],
+            'world_x': (keys_arr[:, 0] + 0.5) * vs,
+            'world_y': (keys_arr[:, 1] + 0.5) * vs,
+            'world_z': (keys_arr[:, 2] + 0.5) * vs,
+            'hit_count': data[:, _H].astype(np.int32),
+            'frame_count': fc,
+            'observation_ratio': fc / 100.0,
+            'ref_mean': ref_mean,
+            'ref_std': np.sqrt(ref_var),
+            'z_min': data[:, _ZMIN],
+            'z_max': data[:, _ZMAX],
+            'z_range': data[:, _ZMAX] - data[:, _ZMIN],
+            'z_mean': z_mean,
+            'z_std': np.sqrt(z_var),
+            'elev_mean': data[:, _EL] / hits,
+        }
 
-                # Store raw vote fractions
-                for c in range(N_CLASSES):
-                    row[f'vote_frac_{c}'] = float(votes[c]) / max(n, 1)
-                row['bg_frac'] = float(bg) / max(n, 1)
+        if with_labels:
+            votes = data[:, _V0:_V0+N_CLASSES]
+            bg = data[:, _BG]
+            total_obs = votes.sum(axis=1)
 
-            rows.append(row)
+            class_id = np.full(nv, BACKGROUND_ID, dtype=np.int32)
+            class_conf = np.ones(nv, dtype=np.float32)
+            is_obs = total_obs > 0
 
-        return pd.DataFrame(rows)
+            if is_obs.any():
+                class_id[is_obs] = votes[is_obs].argmax(axis=1)
+                class_conf[is_obs] = votes[is_obs].max(axis=1) / np.maximum(total_obs[is_obs], 1)
+
+            result['class_id'] = class_id
+            result['class_confidence'] = class_conf
+            result['is_obstacle'] = is_obs
+            for c in range(N_CLASSES):
+                result[f'vote_frac_{c}'] = votes[:, c] / hits
+            result['bg_frac'] = bg / hits
+
+        df = pd.DataFrame(result)
+        print(f"[{time.time()-t0:.1f}s]")
+        return df
 
 
 # ─────────────────────────────────────────────────────────────
 # RGB → CLASS ID
 # ─────────────────────────────────────────────────────────────
 def rgb_to_class_ids(rgb):
-    """Convert (N, 3) RGB array to (N,) class IDs. -1 = background."""
     class_ids = np.full(len(rgb), BACKGROUND_ID, dtype=np.int32)
     for (r, g, b), cid in CLASS_RGB.items():
         mask = (rgb[:, 0] == r) & (rgb[:, 1] == g) & (rgb[:, 2] == b)
@@ -301,24 +232,10 @@ def rgb_to_class_ids(rgb):
 # CONSOLIDATE ONE SCENE
 # ─────────────────────────────────────────────────────────────
 def consolidate_scene(scene_dir, voxel_size=0.5, with_labels=False, verbose=True):
-    """
-    Load all frames in a scene directory, transform to world frame,
-    and accumulate into a VoxelGrid.
-
-    Args:
-        scene_dir: path to directory containing frame_*.npz
-        voxel_size: voxel side length in meters
-        with_labels: if True, use RGB to assign class labels to voxels
-        verbose: print progress
-
-    Returns:
-        VoxelGrid object
-    """
     scene_dir = Path(scene_dir)
     npz_files = sorted(scene_dir.glob('frame_*.npz'))
-
     if not npz_files:
-        raise FileNotFoundError(f"No frame_*.npz files in {scene_dir}")
+        raise FileNotFoundError(f"No frame_*.npz in {scene_dir}")
 
     if verbose:
         print(f"  Consolidating {len(npz_files)} frames from {scene_dir.name}")
@@ -327,35 +244,25 @@ def consolidate_scene(scene_dir, voxel_size=0.5, with_labels=False, verbose=True
 
     for frame_id, npz_path in enumerate(npz_files):
         data = np.load(npz_path)
-        xyz_local = data['xyz']         # (N, 3) local frame, meters
-        reflectivity = data['reflectivity']  # (N,) uint8
-        rgb = data['rgb']               # (N, 3) uint8
-        ego_pose = data['ego_pose']     # (4,) raw units
+        xyz_local = data['xyz']
+        reflectivity = data['reflectivity']
+        rgb = data['rgb']
+        ego_pose = data['ego_pose']
 
-        # Transform to world frame
         xyz_world = local_to_world(xyz_local, ego_pose)
-
-        # Compute elevation angle (from ego, useful feature)
-        dist_horizontal = np.sqrt(xyz_local[:, 0]**2 + xyz_local[:, 1]**2)
-        elevation_angles = np.arctan2(xyz_local[:, 2], dist_horizontal + 1e-8)
-
-        # Class labels (training only)
+        dist_h = np.sqrt(xyz_local[:, 0]**2 + xyz_local[:, 1]**2)
+        elev = np.arctan2(xyz_local[:, 2], dist_h + 1e-8)
         class_ids = rgb_to_class_ids(rgb) if with_labels else None
 
-        # Accumulate
-        grid.accumulate_batch(
-            xyz_world, reflectivity, frame_id,
-            class_ids=class_ids,
-            elevation_angles=elevation_angles,
-        )
+        grid.accumulate_batch(xyz_world, reflectivity, frame_id,
+                              class_ids=class_ids, elevation_angles=elev)
 
         if verbose and (frame_id + 1) % 20 == 0:
-            print(f"    [{frame_id + 1}/{len(npz_files)}] "
-                  f"{len(grid.voxels):,} voxels so far")
+            print(f"    [{frame_id+1}/{len(npz_files)}] "
+                  f"{len(grid.voxels):,} voxels")
 
     if verbose:
-        print(f"    Done: {len(grid.voxels):,} occupied voxels")
-
+        print(f"    Done: {len(grid.voxels):,} voxels")
     return grid
 
 
@@ -364,114 +271,45 @@ def consolidate_scene(scene_dir, voxel_size=0.5, with_labels=False, verbose=True
 # ─────────────────────────────────────────────────────────────
 def process_all_scenes(npz_root, output_dir, voxel_size=0.5,
                        with_labels=False, verbose=True):
-    """
-    Consolidate all scenes found under npz_root.
-
-    Saves per-scene voxel grids as .parquet files.
-    """
     npz_root = Path(npz_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find scene directories
     scene_dirs = sorted([d for d in npz_root.iterdir()
                          if d.is_dir() and d.name.startswith('scene_')])
-
     if not scene_dirs:
-        raise FileNotFoundError(f"No scene_* directories in {npz_root}")
+        raise FileNotFoundError(f"No scene_* dirs in {npz_root}")
 
-    print(f"Found {len(scene_dirs)} scenes in {npz_root}")
-    print(f"Voxel size: {voxel_size}m")
-    print(f"Labels: {'YES' if with_labels else 'NO'}")
-
-    all_scene_stats = []
+    print(f"Found {len(scene_dirs)} scenes | voxel={voxel_size}m | labels={'Y' if with_labels else 'N'}")
 
     for scene_dir in scene_dirs:
         t0 = time.time()
-        scene_name = scene_dir.name
-
-        grid = consolidate_scene(
-            scene_dir, voxel_size=voxel_size,
-            with_labels=with_labels, verbose=verbose,
-        )
-
-        # Convert to DataFrame
+        grid = consolidate_scene(scene_dir, voxel_size, with_labels, verbose)
         df = grid.to_dataframe(with_labels=with_labels)
-        df['scene'] = scene_name
+        df['scene'] = scene_dir.name
 
-        # Save
-        out_path = output_dir / f'{scene_name}_voxels.csv'
+        out_path = output_dir / f'{scene_dir.name}_voxels.csv'
         df.to_csv(out_path, index=False)
 
         elapsed = time.time() - t0
-
-        # Stats
-        n_voxels = len(df)
         if with_labels and 'is_obstacle' in df.columns:
-            n_obstacle = df['is_obstacle'].sum()
-            n_bg = (~df['is_obstacle']).sum()
-            print(f"  {scene_name}: {n_voxels:,} voxels "
-                  f"({n_obstacle:,} obstacle, {n_bg:,} background) [{elapsed:.1f}s]")
-
-            # Per-class breakdown
-            obstacle_df = df[df['is_obstacle']]
-            if len(obstacle_df) > 0:
-                for cid, name in enumerate(CLASS_NAMES):
-                    count = (obstacle_df['class_id'] == cid).sum()
-                    print(f"    {name}: {count:,} voxels")
+            print(f"  Saved {scene_dir.name}: {len(df):,} voxels "
+                  f"({df['is_obstacle'].sum():,} obstacle) [{elapsed:.1f}s]")
         else:
-            print(f"  {scene_name}: {n_voxels:,} voxels [{elapsed:.1f}s]")
+            print(f"  Saved {scene_dir.name}: {len(df):,} voxels [{elapsed:.1f}s]")
 
-        all_scene_stats.append({
-            'scene': scene_name,
-            'n_voxels': n_voxels,
-            'output': str(out_path),
-        })
-
-        # Also save the VoxelGrid object for later use (back-projection)
-        grid_path = output_dir / f'{scene_name}_grid.npz'
-        _save_grid_compact(grid, grid_path)
-
-    # Summary
-    stats_df = pd.DataFrame(all_scene_stats)
-    stats_df.to_csv(output_dir / 'consolidation_stats.csv', index=False)
-    print(f"\nTotal: {stats_df['n_voxels'].sum():,} voxels across {len(scene_dirs)} scenes")
-
-    return stats_df
+        del grid, df  # free memory between scenes
 
 
-def _save_grid_compact(grid, path):
-    """Save VoxelGrid indices and voxel_size for back-projection."""
-    keys = np.array(list(grid.voxels.keys()), dtype=np.int32)  # (M, 3)
-    np.savez_compressed(
-        path,
-        voxel_indices=keys,
-        voxel_size=np.array([grid.voxel_size]),
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(
-        description='Consolidate multi-frame scenes into voxel grids')
-    parser.add_argument('--npz-root', type=str, default='processed/',
-                        help='Root directory with scene_*/frame_*.npz')
-    parser.add_argument('--output-dir', type=str, default='consolidated/',
-                        help='Output directory for voxel grids')
-    parser.add_argument('--voxel-size', type=float, default=0.5,
-                        help='Voxel side length in meters (default: 0.5)')
-    parser.add_argument('--with-labels', action='store_true',
-                        help='Use RGB labels for training data')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--npz-root', default='processed/')
+    parser.add_argument('--output-dir', default='consolidated/')
+    parser.add_argument('--voxel-size', type=float, default=0.5)
+    parser.add_argument('--with-labels', action='store_true')
     args = parser.parse_args()
-
-    process_all_scenes(
-        args.npz_root, args.output_dir,
-        voxel_size=args.voxel_size,
-        with_labels=args.with_labels,
-        verbose=True,
-    )
+    process_all_scenes(args.npz_root, args.output_dir, args.voxel_size,
+                       args.with_labels, verbose=True)
 
 
 if __name__ == '__main__':
