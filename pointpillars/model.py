@@ -62,6 +62,7 @@ class PillarVFE(nn.Module):
 
         # Max pool over points in each pillar
         x = x.max(dim=1)[0]                                # (P, C)
+        x = x.masked_fill(torch.isinf(x), 0.0)             # Empty pillars → zero vector
         return x
 
 

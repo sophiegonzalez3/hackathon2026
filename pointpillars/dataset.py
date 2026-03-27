@@ -366,10 +366,13 @@ def collate_fn(batch):
 
 
 def build_dataloaders(cfg, aug_cfg=None):
-    """Create train and val DataLoaders. Augmentation auto-enabled for train."""
+    """Create train and val DataLoaders."""
+    # Use cfg.train_augment if it exists, default to True for backward compatibility
+    do_augment = getattr(cfg, 'train_augment', True)
+    
     train_ds = AirbusLidarDataset(
         cfg, split='train', gt_csv=cfg.gt_csv,
-        augment=True, aug_cfg=aug_cfg,
+        augment=do_augment, aug_cfg=aug_cfg,  # ← now configurable
     )
     val_ds = AirbusLidarDataset(
         cfg, split='val', gt_csv=cfg.gt_csv,
