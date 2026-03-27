@@ -5,7 +5,7 @@ Pillarization, Gaussian target generation, CenterNet-style decoding & NMS.
 """
 
 import numpy as np
-
+import torch
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Pillarization (numpy, done in dataset __getitem__)

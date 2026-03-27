@@ -1,8 +1,16 @@
 """
-PointPillars + CenterHead — Dataset
-=====================================
+PointPillars + CenterHead — Dataset (with Augmentation)
+========================================================
 Loads preprocessed .npz frames (from preprocess_frames.py) and ground-truth
 bboxes from the cleaned CSV.  Returns pillarized tensors + CenterHead targets.
+
+Augmentation (train only):
+  1. Random Y-flip          — flips points AND box centers/yaw
+  2. Random Z-rotation      — rotates points AND box centers/yaw
+  3. Random uniform scaling  — scales points AND box centers + dimensions
+  4. Gaussian jitter         — per-point noise (no box change needed)
+  5. Random point dropout    — simulates 25%/50%/75%/100% density
+                               (matches evaluation conditions)
 """
 
 import numpy as np
@@ -13,6 +21,115 @@ from pathlib import Path
 
 from .utils import pillarize, generate_targets
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Online Augmentation (applied in __getitem__, transforms points + boxes)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def augment_frame(xyz, gt_boxes, cfg_aug):
+    """
+    Apply random augmentations to BOTH the point cloud and the GT boxes.
+
+    Parameters
+    ----------
+    xyz      : (N, 3) float32 — point coordinates
+    gt_boxes : list of dicts, each with keys:
+               class_id, bbox_center_x/y/z, bbox_width/length/height, bbox_yaw
+    cfg_aug  : dict with augmentation hyperparameters
+
+    Returns
+    -------
+    xyz_aug  : (N', 3) float32 — augmented points (N' <= N if dropout applied)
+    gt_boxes : list of dicts    — augmented boxes (modified in-place copies)
+    refl_mask: (N,) bool or None — if dropout applied, mask to apply to reflectivity
+    """
+    xyz_aug = xyz.copy()
+    # Deep copy boxes so we don't corrupt the cached GT
+    boxes = [dict(b) for b in gt_boxes]
+
+    flip_prob      = cfg_aug.get('flip_prob', 0.5)
+    max_rot_deg    = cfg_aug.get('max_rotation_deg', 180)
+    scale_range    = cfg_aug.get('scale_range', (0.95, 1.05))
+    jitter_sigma   = cfg_aug.get('jitter_sigma', 0.01)
+    dropout_ratios = cfg_aug.get('dropout_ratios', [1.0, 0.75, 0.50, 0.25])
+
+    # ── 1. Random Y-flip ─────────────────────────────────────────────────
+    if np.random.rand() < flip_prob:
+        xyz_aug[:, 1] = -xyz_aug[:, 1]
+        for b in boxes:
+            b['bbox_center_y'] = -b['bbox_center_y']
+            b['bbox_yaw']      = -b['bbox_yaw']
+
+    # ── 2. Random Z-rotation ─────────────────────────────────────────────
+    angle_deg = np.random.uniform(-max_rot_deg, max_rot_deg)
+    angle_rad = np.radians(angle_deg)
+    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+    rot_matrix = np.array([
+        [cos_a, -sin_a, 0],
+        [sin_a,  cos_a, 0],
+        [0,      0,     1],
+    ], dtype=np.float32)
+
+    xyz_aug = xyz_aug @ rot_matrix.T
+
+    for b in boxes:
+        cx, cy = b['bbox_center_x'], b['bbox_center_y']
+        b['bbox_center_x'] = cos_a * cx - sin_a * cy
+        b['bbox_center_y'] = sin_a * cx + cos_a * cy
+        b['bbox_yaw']      = b['bbox_yaw'] + angle_rad
+
+    # ── 3. Random uniform scaling ────────────────────────────────────────
+    scale = np.random.uniform(scale_range[0], scale_range[1])
+    xyz_aug = xyz_aug * scale
+
+    for b in boxes:
+        b['bbox_center_x'] *= scale
+        b['bbox_center_y'] *= scale
+        b['bbox_center_z'] *= scale
+        b['bbox_width']    *= scale
+        b['bbox_length']   *= scale
+        b['bbox_height']   *= scale
+
+    # ── 4. Gaussian jitter (points only — boxes unchanged) ───────────────
+    clip_val = jitter_sigma * 5
+    jitter = np.clip(
+        jitter_sigma * np.random.randn(*xyz_aug.shape),
+        -clip_val, clip_val
+    ).astype(np.float32)
+    xyz_aug = xyz_aug + jitter
+
+    # ── 5. Random point dropout (density robustness) ─────────────────────
+    #    Simulates the 25/50/75/100% evaluation conditions.
+    #    We pick a random keep-ratio each time so the model sees all densities.
+    keep_ratio = np.random.choice(dropout_ratios)
+    if keep_ratio < 1.0:
+        n_points = len(xyz_aug)
+        n_keep = max(int(n_points * keep_ratio), 1)
+        keep_idx = np.random.choice(n_points, size=n_keep, replace=False)
+        keep_idx.sort()
+        xyz_aug = xyz_aug[keep_idx]
+        return xyz_aug, boxes, keep_idx
+    else:
+        return xyz_aug, boxes, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Default augmentation config
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_AUG_CFG = {
+    'flip_prob': 0.5,
+    'max_rotation_deg': 180,
+    'scale_range': (0.95, 1.05),
+    'jitter_sigma': 0.01,
+    # Include all eval densities + full density (weighted toward full)
+    'dropout_ratios': [1.0, 1.0, 1.0, 0.75, 0.50, 0.25],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dataset
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class AirbusLidarDataset(Dataset):
     """
@@ -25,17 +142,28 @@ class AirbusLidarDataset(Dataset):
     For inference (no GT), set gt_csv=None.
     """
 
-    def __init__(self, cfg, split='train', gt_csv=None, processed_dir=None):
+    def __init__(self, cfg, split='train', gt_csv=None, processed_dir=None,
+                 augment=None, aug_cfg=None):
         """
         Args:
-            cfg: Config object
-            split: 'train' or 'val' — determines which scenes to use
-            gt_csv: path to GT CSV (None for inference)
+            cfg          : Config object
+            split        : 'train' or 'val' — determines which scenes to use
+            gt_csv       : path to GT CSV (None for inference)
             processed_dir: override cfg.processed_dir
+            augment      : bool or None — if None, auto-set to True for train
+            aug_cfg      : dict — augmentation hyperparameters (see DEFAULT_AUG_CFG)
         """
         self.cfg = cfg
         self.split = split
         self.has_gt = gt_csv is not None
+
+        # Auto-enable augmentation for training only
+        if augment is None:
+            self.augment = (split == 'train')
+        else:
+            self.augment = augment
+
+        self.aug_cfg = aug_cfg or DEFAULT_AUG_CFG
 
         proc_dir = Path(processed_dir or cfg.processed_dir)
         self.processed_dir = proc_dir
@@ -98,8 +226,9 @@ class AirbusLidarDataset(Dataset):
                     })
                 self.gt_by_frame[(scene, pose)] = boxes
 
+        aug_status = "ON" if self.augment else "OFF"
         print(f"Dataset [{split}]: {len(self.manifest)} frames, "
-              f"{len(self.gt_by_frame)} frames with GT")
+              f"{len(self.gt_by_frame)} frames with GT, augment={aug_status}")
 
     def __len__(self):
         return len(self.manifest)
@@ -121,7 +250,20 @@ class AirbusLidarDataset(Dataset):
         # Normalize reflectivity to [0, 1]
         reflectivity = reflectivity / 255.0
 
-        # Combine: (N, 4) = [x, y, z, reflectivity]
+        # ── Load GT boxes for this frame ──────────────────────────────────
+        gt_boxes = self.gt_by_frame.get((scene, pose_index), [])
+
+        # ══════════════════════════════════════════════════════════════════
+        # AUGMENTATION (train only) — transforms points AND boxes together
+        # ══════════════════════════════════════════════════════════════════
+        if self.augment and self.has_gt:
+            xyz, gt_boxes, keep_idx = augment_frame(xyz, gt_boxes, self.aug_cfg)
+
+            # If point dropout was applied, subsample reflectivity too
+            if keep_idx is not None:
+                reflectivity = reflectivity[keep_idx]
+
+        # ── Combine: (N, 4) = [x, y, z, reflectivity] ────────────────────
         points = np.column_stack([xyz, reflectivity])
 
         # ── Pillarize ─────────────────────────────────────────────────────
@@ -129,7 +271,6 @@ class AirbusLidarDataset(Dataset):
 
         # ── Build targets ─────────────────────────────────────────────────
         if self.has_gt:
-            gt_boxes = self.gt_by_frame.get((scene, pose_index), [])
             heatmap, offset, z_tgt, dim_tgt, rot_tgt, reg_mask, indices, num_objs = \
                 generate_targets(gt_boxes, self.cfg)
         else:
@@ -160,6 +301,10 @@ class AirbusLidarDataset(Dataset):
             'ego_pose': ego_pose.astype(np.float64),
         }
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Collate & DataLoader builder
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def collate_fn(batch):
     """
@@ -220,10 +365,16 @@ def collate_fn(batch):
     }
 
 
-def build_dataloaders(cfg):
-    """Create train and val DataLoaders."""
-    train_ds = AirbusLidarDataset(cfg, split='train', gt_csv=cfg.gt_csv)
-    val_ds = AirbusLidarDataset(cfg, split='val', gt_csv=cfg.gt_csv)
+def build_dataloaders(cfg, aug_cfg=None):
+    """Create train and val DataLoaders. Augmentation auto-enabled for train."""
+    train_ds = AirbusLidarDataset(
+        cfg, split='train', gt_csv=cfg.gt_csv,
+        augment=True, aug_cfg=aug_cfg,
+    )
+    val_ds = AirbusLidarDataset(
+        cfg, split='val', gt_csv=cfg.gt_csv,
+        augment=False,  # NEVER augment validation
+    )
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
