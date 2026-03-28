@@ -21,6 +21,6 @@ pillar_feat_channels: 64
 head_stride: 2
 heatmap_h: 280
 heatmap_w: 208
-score_threshold: 0.1
+score_threshold: 0.3
 nms_kernel: 3
 max_detections: 50
