@@ -13,8 +13,8 @@ from typing import List, Dict, Tuple
 class Config:
     # ── Paths ─────────────────────────────────────────────────────────────
     processed_dir: str = "processed/"
-    gt_csv: str = "gt_runs/gt_bboxes_run_05_merge.csv"
-
+    gt_csv: str = "gt_runs/gt_bboxes_run_05_merge_clean.csv"
+    class_loss_weights = None
     # ── Train / Val split (scene-level) ───────────────────────────────────
     # Hold out 2 scenes: one "similar" (scene_9), one "different" (scene_10)
     # to mimic the eval setup (known + unknown scenes)
@@ -108,7 +108,7 @@ class Config:
         pcr = self.point_cloud_range
         self.grid_x = int((pcr[3] - pcr[0]) / self.pillar_x)   # 416
         self.grid_y = int((pcr[4] - pcr[1]) / self.pillar_y)   # 560
-
+        self.class_loss_weights = None
         # Sanity: grid must be divisible by the total backbone stride
         total_stride = 1
         for _, _, s in self.backbone_blocks:
