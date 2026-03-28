@@ -13,7 +13,7 @@ from typing import List, Dict, Tuple
 class Config:
     # ── Paths ─────────────────────────────────────────────────────────────
     processed_dir: str = "processed/"
-    gt_csv: str = "gt_bboxes_run_05_merge_clean.csv"
+    gt_csv: str = "gt_runs/gt_bboxes_run_05_merge.csv"
 
     # ── Train / Val split (scene-level) ───────────────────────────────────
     # Hold out 2 scenes: one "similar" (scene_9), one "different" (scene_10)
@@ -120,11 +120,11 @@ class Config:
 
     @property
     def heatmap_h(self):
-        return self.grid_x // self.head_stride
+        return self.grid_y // self.head_stride  # H = Y axis
 
     @property
     def heatmap_w(self):
-        return self.grid_y // self.head_stride
+        return self.grid_x // self.head_stride  # W = X axis
 
     def print_summary(self):
         print(f"{'='*60}")

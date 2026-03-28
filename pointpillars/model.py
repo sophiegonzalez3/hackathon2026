@@ -92,14 +92,14 @@ class PointPillarScatter(nn.Module):
         C = self.in_channels
         device = pillar_features.device
 
-        bev = torch.zeros(batch_size, C, self.grid_x, self.grid_y,
+        bev = torch.zeros(batch_size, C, self.grid_y, self.grid_x,
                           dtype=pillar_features.dtype, device=device)
 
         batch_idx = pillar_coords[:, 0].long()
         x_idx = pillar_coords[:, 1].long()
         y_idx = pillar_coords[:, 2].long()
 
-        bev[batch_idx, :, x_idx, y_idx] = pillar_features
+        bev[batch_idx, :, y_idx, x_idx] = pillar_features
 
         return bev
 
