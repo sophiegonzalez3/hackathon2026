@@ -1,0 +1,21 @@
+{
+  "scene": "scene_2",
+  "timestamp": "2026-03-28T15:34:27.643766",
+  "method": "local_ground_model",
+  "tile_size": 5.0,
+  "threshold_used": 2,
+  "thresholds_tested": [
+    2,
+    5
+  ],
+  "min_survival_requirements": {
+    "Antenna": 0.6,
+    "Electric Pole": 0.7,
+    "Wind Turbine": 0.75
+  },
+  "points_original": 27583426,
+  "points_kept": 9629733,
+  "points_removed_pct": 65.09,
+  "output_dir": "/content/hackathon/cleaned/scene_2",
+  "kept_indices_saved": true
+}
