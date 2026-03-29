@@ -119,6 +119,9 @@ def analyze_scene(
 ) -> Tuple[Dict, Dict, Dict]:
     """
     Analyze survival rates for different height thresholds.
+    
+    Note: Class-specific survival rates require RGB labels.
+    For test data without labels, only total point stats are available.
 
     Returns:
         results: Per-class survival counts {threshold: {class: {total, survived}}}
@@ -132,21 +135,26 @@ def analyze_scene(
     results_noise = {t: {'total': 0, 'survived': 0} for t in thresholds}
     results_all = {t: {'total': 0, 'survived': 0} for t in thresholds}
 
+    has_rgb = False
+    
     for npz_path in tqdm(npz_files, desc=f"  Analyzing {scene_dir.name}"):
         data = np.load(npz_path)
         xyz = data['xyz']
         rgb = data.get('rgb', None)
 
-        if rgb is None:
-            continue
-
         hag, _ = compute_local_ground_height(xyz, tile_size=tile_size)
         n_total = len(xyz)
 
-        # All points stats
+        # All points stats (always available)
         for t in thresholds:
             results_all[t]['total'] += n_total
             results_all[t]['survived'] += int((hag > t).sum())
+
+        # Class-specific stats (only if RGB available)
+        if rgb is None:
+            continue
+            
+        has_rgb = True
 
         # Per-class stats
         all_class_mask = np.zeros(len(rgb), dtype=bool)
@@ -167,6 +175,12 @@ def analyze_scene(
             for t in thresholds:
                 results_noise[t]['total'] += n_noise
                 results_noise[t]['survived'] += int((noise_mask & (hag > t)).sum())
+
+    # Warn if no RGB found (test data)
+    if not has_rgb:
+        print(f"  ⚠ No RGB labels found in {scene_dir.name}")
+        print(f"    Class survival rates unavailable (this is normal for test data)")
+        print(f"    Use --threshold X with value from training analysis")
 
     return results, results_noise, results_all
 
@@ -214,12 +228,28 @@ def find_best_threshold(
     metrics_df: pd.DataFrame,
     min_survival: Dict[str, float]
 ) -> Optional[float]:
-    """Find the best threshold that satisfies survival requirements."""
+    """
+    Find the best threshold that satisfies survival requirements.
+    
+    Returns None if no class data available (test mode) or no threshold satisfies requirements.
+    """
+    # Check if we have class data
+    has_class_data = False
+    for cls in min_survival.keys():
+        col = f'{cls}_survival_pct'
+        if col in metrics_df.columns and metrics_df[col].notna().any():
+            has_class_data = True
+            break
+    
+    if not has_class_data:
+        # No class data (test mode) - can't auto-select
+        return None
+    
     for _, row in metrics_df.iterrows():
         valid = True
         for cls, min_rate in min_survival.items():
             val = row.get(f'{cls}_survival_pct')
-            if val is not None and val < min_rate * 100:
+            if val is not None and not pd.isna(val) and val < min_rate * 100:
                 valid = False
                 break
         if valid:
@@ -229,28 +259,42 @@ def find_best_threshold(
 
 def print_analysis_table(metrics_df: pd.DataFrame, min_survival: Dict[str, float]):
     """Print a formatted analysis table."""
-    print(f"\n  {'Thresh':>7} | {'Antenna':>8} {'Cable':>8} {'Pole':>8} {'Turbine':>8} | {'Noise Rem':>10} | Status")
-    print("  " + "-" * 80)
+    # Check if we have class data
+    has_class_data = metrics_df['Antenna_survival_pct'].notna().any() if 'Antenna_survival_pct' in metrics_df.columns else False
+    
+    if has_class_data:
+        print(f"\n  {'Thresh':>7} | {'Antenna':>8} {'Cable':>8} {'Pole':>8} {'Turbine':>8} | {'Noise Rem':>10} | Status")
+        print("  " + "-" * 80)
 
-    for _, row in metrics_df.iterrows():
-        def fmt(val):
-            return f"{val:>6.1f}%" if val is not None else "   N/A "
+        for _, row in metrics_df.iterrows():
+            def fmt(val):
+                return f"{val:>6.1f}%" if val is not None and not pd.isna(val) else "   N/A "
 
-        t = row['threshold_m']
-        ant = row.get('Antenna_survival_pct')
-        cab = row.get('Cable_survival_pct')
-        pole = row.get('Electric Pole_survival_pct')
-        turb = row.get('Wind Turbine_survival_pct')
-        noise_rem = row['noise_removed_pct']
+            t = row['threshold_m']
+            ant = row.get('Antenna_survival_pct')
+            cab = row.get('Cable_survival_pct')
+            pole = row.get('Electric Pole_survival_pct')
+            turb = row.get('Wind Turbine_survival_pct')
+            noise_rem = row['noise_removed_pct']
 
-        status = "✓"
-        for cls, min_rate in min_survival.items():
-            val = row.get(f'{cls}_survival_pct')
-            if val is not None and val < min_rate * 100:
-                status = "✗"
-                break
+            status = "✓"
+            for cls, min_rate in min_survival.items():
+                val = row.get(f'{cls}_survival_pct')
+                if val is not None and not pd.isna(val) and val < min_rate * 100:
+                    status = "✗"
+                    break
 
-        print(f"  {t:>6.1f}m | {fmt(ant)} {fmt(cab)} {fmt(pole)} {fmt(turb)} | {fmt(noise_rem)} | {status}")
+            print(f"  {t:>6.1f}m | {fmt(ant)} {fmt(cab)} {fmt(pole)} {fmt(turb)} | {fmt(noise_rem)} | {status}")
+    else:
+        # No class data (test mode) - just show total point stats
+        print(f"\n  {'Thresh':>7} | {'Total Kept':>12} | {'Removed':>10}")
+        print("  " + "-" * 40)
+        
+        for _, row in metrics_df.iterrows():
+            t = row['threshold_m']
+            kept_pct = 100 - row['total_removed_pct']
+            removed_pct = row['total_removed_pct']
+            print(f"  {t:>6.1f}m | {kept_pct:>10.1f}% | {removed_pct:>8.1f}%")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -266,6 +310,9 @@ def clean_scene(
 ) -> Tuple[Dict, List[Dict]]:
     """
     Clean all frames in a scene and generate manifest.
+    
+    Works with or without RGB labels (test data may not have labels).
+    The ground removal algorithm only uses XYZ coordinates.
 
     Returns:
         stats: {original, kept, output_dir}
@@ -879,8 +926,18 @@ def run_pipeline(
     if threshold is None:
         threshold = find_best_threshold(combined_metrics, min_survival)
         if threshold is None:
-            print("\n  ⚠ No threshold satisfies all survival requirements!")
-            threshold = thresholds_to_test[0]  # Use most conservative
+            # Check if this is because of missing class data (test mode)
+            has_class_data = combined_metrics['Antenna_survival_pct'].notna().any() if 'Antenna_survival_pct' in combined_metrics.columns else False
+            
+            if not has_class_data:
+                print("\n  ⚠ No RGB class labels found (test data mode)")
+                print("    Cannot auto-select threshold without class survival info")
+                print("    Please specify --threshold X using value from training analysis")
+                print("    Example: --threshold 5.0")
+                return
+            else:
+                print("\n  ⚠ No threshold satisfies all survival requirements!")
+                threshold = thresholds_to_test[0]  # Use most conservative
         print(f"\n  → Selected threshold: {threshold}m")
     else:
         print(f"\n  → Using specified threshold: {threshold}m")
@@ -966,19 +1023,30 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Full pipeline with auto threshold selection
-    python ground_removal.py --processed-dir processed/ --output-dir cleaned/
-
-    # Analysis only
+    # ══════════════════════════════════════════════════════════════════
+    # TRAINING TIME (with class labels in RGB)
+    # ══════════════════════════════════════════════════════════════════
+    
+    # Find best threshold based on class survival
     python ground_removal.py --processed-dir processed/ --analyze-only
-
-    # Custom threshold with sanity check
+    
+    # Full pipeline with auto threshold selection
     python ground_removal.py --processed-dir processed/ --output-dir cleaned/ \\
-        --threshold 3.0 --sanity-check
+        --sanity-check
+    
+    # Visualize what's happening
+    python ground_removal.py --visualize processed/scene_1/frame_050.npz
 
-    # Process specific scenes
-    python ground_removal.py --processed-dir processed/ --output-dir cleaned/ \\
-        --scenes scene_1 scene_2
+    # ══════════════════════════════════════════════════════════════════
+    # TEST/EVALUATION TIME (no class labels)
+    # ══════════════════════════════════════════════════════════════════
+    
+    # Apply the threshold you found during training
+    python ground_removal.py --processed-dir test_processed/ --output-dir test_cleaned/ \\
+        --threshold 5.0
+    
+    # Note: --analyze-only and --sanity-check won't show class stats without RGB,
+    # but ground removal still works perfectly (it only uses XYZ).
         """
     )
 
