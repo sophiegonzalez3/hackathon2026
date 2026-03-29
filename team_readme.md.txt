@@ -21,26 +21,25 @@ project/
 │   ├── generate_gt_bboxes.py      # Generate ground truth
 │   ├── extra_cleaning_bbox.py     # Clean GT outliers
 │   ├── ground_removal.py          # Ground removal + sanity check
-│   └── postprocess_predictions.py # Filter predictions
+│   └── postprocess_predictions.py # Filter predictions (after training + inference)
 │
-├── configs/                       # Configuration files
+├── configs/                       # Configuration files for the Bbox dbscan algo
 │   └── run_05_merge.yaml          # GT generation config
 │
 ├── checkpoints/                   # Trained models
 │   └── best.pth
-│
-├── data/                          # Data directories
-│   ├── raw/                       # Raw H5 files (trainingData/)
-│   │   └── scene_*.h5
-│   ├── processed/                 # Preprocessed NPZ (with ground)
+│                                   # Data directories
+├── trainingData/                  # Raw H5 files (trainingData/)
+│   ├── scene_*.h5                      
+│── processed/                     # Preprocessed NPZ (with ground)
+│   ├── scene_*/
+│   │   └── frame_*.npz
+│   └── manifest.csv
+│── cleaned/                       # Ground-removed NPZ
 │   │   ├── scene_*/
 │   │   │   └── frame_*.npz
 │   │   └── manifest.csv
-│   ├── cleaned/                   # Ground-removed NPZ
-│   │   ├── scene_*/
-│   │   │   └── frame_*.npz
-│   │   └── manifest.csv
-│   └── gt/                        # Ground truth CSVs
+│── gt_runs/                        # Ground truth bbox CSVs can be compared using ln.compare_side_bboxes or compare_side_bboxes_batch
 │       ├── gt_bboxes.csv
 │       └── gt_bboxes_clean.csv
 │
@@ -49,8 +48,7 @@ project/
 │   ├── predictions_submission.csv
 │   └── predictions_filtered.csv
 │
-└── notebooks/                     # Jupyter notebooks
-    └── exploration.ipynb
+
 ```
 
 ---
@@ -103,40 +101,42 @@ project/
 
 ### Training (from scratch)
 
+Upload h5 files to a trainingData folder
+
 ```bash
 # 1. Preprocess H5 → NPZ
 python pipeline/preprocess_frames.py \
-    --data-dir data/raw/ \
-    --out-dir data/processed/
+    --data-dir trainingData/ \
+    --out-dir processed/
 
 # 2. Generate ground truth
 python pipeline/generate_gt_bboxes.py \
-    --processed-dir data/processed/ \
+    --processed-dir processed/ \
     --config configs/run_05_merge.yaml \
-    --output data/gt/gt_bboxes.csv
+    --out gt_runs/gt_bboxes.csv
 
 # 3. Clean GT
 python pipeline/extra_cleaning_bbox.py \
-    data/gt/gt_bboxes.csv \
-    data/gt/gt_bboxes_clean.csv
+    --input gt_runs/gt_bboxes.csv \
+    --out gt_runs/gt_bboxes_clean.csv
 
 # 4. Remove ground (+ fix manifest & GT paths)
 python pipeline/ground_removal.py \
-    --processed-dir data/processed/ \
-    --output-dir data/cleaned/ \
-    --gt-csv data/gt/gt_bboxes_clean.csv \
+    --processed-dir processed/ \
+    --output-dir cleaned/ \
+    --gt-csv gt_runs/gt_bboxes_clean.csv \
     --sanity-check
 
 # 5. Train
 python -m pointpillars.train \
-    --processed-dir data/cleaned/ \
-    --gt-csv data/gt/gt_bboxes_clean2.csv \
+    --processed-dir cleaned/ \
+    --gt-csv gt_runs/gt_bboxes_clean2.csv \
     --checkpoint-dir checkpoints/
 
 # 6. Inference
 python -m pointpillars.inference \
     --checkpoint checkpoints/best.pth \
-    --processed-dir data/cleaned/ \
+    --processed-dir cleaned/ \
     --output results/predictions.csv
 
 # 7. Post-process
@@ -150,18 +150,19 @@ python pipeline/postprocess_predictions.py \
 ```bash
 # 1. Preprocess test H5
 python pipeline/preprocess_frames.py \
-    --data-dir testData/ \
-    --out-dir data/test_processed/
+    --data-dir Eval/testData/ \
+    --out-dir Eval/test_processed/
 
 # 2. Remove ground
 python pipeline/ground_removal.py \
-    --processed-dir data/test_processed/ \
-    --output-dir data/test_cleaned/
+    --processed-dir Eval/test_processed/ \
+    --output-dir Eval/test_cleaned/ \
+    --threshold 2.0 #Use the best/safest after analyse on your training
 
 # 3. Inference
 python -m pointpillars.inference \
     --checkpoint checkpoints/best.pth \
-    --processed-dir data/test_cleaned/ \
+    --processed-dir Eval/test_cleaned/ \
     --output submission.csv
 
 # 4. Post-process (optional but recommended)
