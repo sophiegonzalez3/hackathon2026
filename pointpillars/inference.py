@@ -69,6 +69,63 @@ def _import_pointpillars():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CHECKPOINT UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def inspect_checkpoint(checkpoint_path: str) -> Dict:
+    """
+    Inspect a checkpoint file to see its format and contents.
+    
+    Useful for debugging loading issues.
+    
+    Example:
+        info = inspect_checkpoint('exported_models/pointpillars_weights.pth')
+        print(info)
+    """
+    ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    
+    info = {
+        'path': checkpoint_path,
+        'type': type(ckpt).__name__,
+    }
+    
+    if isinstance(ckpt, torch.nn.Module):
+        info['format'] = 'full_model'
+        info['model_class'] = ckpt.__class__.__name__
+        info['num_parameters'] = sum(p.numel() for p in ckpt.parameters())
+    elif isinstance(ckpt, dict):
+        info['keys'] = list(ckpt.keys())
+        
+        # Identify format
+        if 'model_state_dict' in ckpt:
+            info['format'] = 'training_checkpoint'
+            info['has_config'] = 'config' in ckpt
+            info['epoch'] = ckpt.get('epoch', 'N/A')
+            info['val_loss'] = ckpt.get('val_loss', 'N/A')
+            info['num_layers'] = len(ckpt['model_state_dict'])
+        elif 'state_dict' in ckpt:
+            info['format'] = 'exported_state_dict'
+            info['num_layers'] = len(ckpt['state_dict'])
+        elif 'weights' in ckpt:
+            info['format'] = 'weights_dict'
+            info['num_layers'] = len(ckpt['weights'])
+        else:
+            # Check if it's a raw state dict
+            sample_keys = list(ckpt.keys())[:5]
+            if any('.' in k for k in sample_keys):
+                info['format'] = 'raw_state_dict'
+                info['num_layers'] = len(ckpt)
+                info['sample_keys'] = sample_keys
+            else:
+                info['format'] = 'unknown'
+                info['sample_keys'] = sample_keys
+    else:
+        info['format'] = 'unknown'
+    
+    return info
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MODEL LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -81,8 +138,13 @@ def load_model(
     """
     Load trained model from checkpoint.
     
+    Handles multiple checkpoint formats:
+        - Training checkpoint: {'model_state_dict': ..., 'config': ..., 'epoch': ...}
+        - Exported weights: {'state_dict': ...} or just raw state_dict
+        - Full model: torch.save(model, path)
+    
     Args:
-        checkpoint_path: Path to .pth checkpoint
+        checkpoint_path: Path to .pth or .pt checkpoint
         device: Device to load to (auto-detected if None)
         score_threshold: Override detection threshold
         verbose: Print loading info
@@ -94,6 +156,7 @@ def load_model(
     
     Example:
         model, cfg, device = load_model('checkpoints/best.pth')
+        model, cfg, device = load_model('exported_models/pointpillars_weights.pth')
     """
     Config, PointPillarsCenterHead, _, _, _ = _import_pointpillars()
     
@@ -104,20 +167,115 @@ def load_model(
     # Load checkpoint
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # Reconstruct config
-    cfg = ckpt.get('config', Config())
+    # ══════════════════════════════════════════════════════════════════════
+    # Handle different checkpoint formats
+    # ══════════════════════════════════════════════════════════════════════
+    
+    cfg = None
+    state_dict = None
+    epoch_info = "?"
+    
+    # Case 1: Full model saved with torch.save(model, path)
+    if isinstance(ckpt, torch.nn.Module):
+        if verbose:
+            print(f"  Detected format: full model")
+        model = ckpt.to(device)
+        model.eval()
+        
+        # Try to get config from model
+        cfg = getattr(model, 'cfg', None) or Config()
+        if score_threshold is not None:
+            cfg.score_threshold = score_threshold
+            
+        if verbose:
+            print(f"✓ Loaded full model")
+            print(f"  Score threshold: {cfg.score_threshold}")
+        
+        return model, cfg, device
+    
+    # Case 2: Dictionary checkpoint
+    if isinstance(ckpt, dict):
+        # Try to find config
+        cfg = ckpt.get('config', None)
+        epoch_info = ckpt.get('epoch', '?')
+        
+        # Try different keys for state dict
+        if 'model_state_dict' in ckpt:
+            state_dict = ckpt['model_state_dict']
+            if verbose:
+                print(f"  Detected format: training checkpoint")
+        elif 'state_dict' in ckpt:
+            state_dict = ckpt['state_dict']
+            if verbose:
+                print(f"  Detected format: exported state_dict")
+        elif 'weights' in ckpt:
+            state_dict = ckpt['weights']
+            if verbose:
+                print(f"  Detected format: weights dict")
+        elif 'model' in ckpt:
+            # Could be state dict or full model
+            if isinstance(ckpt['model'], dict):
+                state_dict = ckpt['model']
+                if verbose:
+                    print(f"  Detected format: model dict")
+            else:
+                # Full model nested in dict
+                model = ckpt['model'].to(device)
+                model.eval()
+                cfg = cfg or getattr(model, 'cfg', None) or Config()
+                if score_threshold is not None:
+                    cfg.score_threshold = score_threshold
+                if verbose:
+                    print(f"✓ Loaded nested full model")
+                return model, cfg, device
+        else:
+            # Assume it's a raw state dict (no wrapper)
+            # Check if it looks like a state dict (has typical layer names)
+            sample_keys = list(ckpt.keys())[:5]
+            if any('.' in k for k in sample_keys):  # Layer names have dots
+                state_dict = ckpt
+                if verbose:
+                    print(f"  Detected format: raw state_dict")
+            else:
+                raise ValueError(
+                    f"Unknown checkpoint format. Keys: {list(ckpt.keys())[:10]}\n"
+                    f"Expected one of: 'model_state_dict', 'state_dict', 'weights', 'model'"
+                )
+    else:
+        raise ValueError(f"Unknown checkpoint type: {type(ckpt)}")
+    
+    # ══════════════════════════════════════════════════════════════════════
+    # Build model and load state dict
+    # ══════════════════════════════════════════════════════════════════════
+    
+    # Use config from checkpoint or create default
+    if cfg is None:
+        cfg = Config()
+        if verbose:
+            print(f"  ⚠ No config in checkpoint, using defaults")
     
     if score_threshold is not None:
         cfg.score_threshold = score_threshold
     
-    # Build and load model
+    # Build model
     model = PointPillarsCenterHead(cfg).to(device)
-    model.load_state_dict(ckpt['model_state_dict'])
+    
+    # Load state dict (handle potential key mismatches)
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as e:
+        if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
+            if verbose:
+                print(f"  ⚠ Key mismatch, trying strict=False")
+            model.load_state_dict(state_dict, strict=False)
+        else:
+            raise
+    
     model.eval()
     
     if verbose:
-        print(f"✓ Loaded checkpoint from epoch {ckpt.get('epoch', '?')}")
-        val_loss = ckpt.get('val_loss')
+        print(f"✓ Loaded checkpoint from epoch {epoch_info}")
+        val_loss = ckpt.get('val_loss') if isinstance(ckpt, dict) else None
         if val_loss is not None:
             print(f"  Val loss: {val_loss:.4f}")
         print(f"  Score threshold: {cfg.score_threshold}")
@@ -459,26 +617,37 @@ Examples:
         --checkpoint checkpoints/best.pth \\
         --processed-dir cleaned/
 
-    # Evaluation day
+    # Evaluation day (with exported model)
     python -m pointpillars.inference \\
-        --checkpoint checkpoints/best.pth \\
+        --checkpoint exported_models/pointpillars_weights.pth \\
         --processed-dir test_cleaned/ \\
         --output submission.csv \\
         --threshold 0.2
+
+    # Inspect checkpoint format (debug)
+    python -m pointpillars.inference \\
+        --checkpoint exported_models/pointpillars_weights.pth \\
+        --inspect
 
     # Quick test
     python -m pointpillars.inference \\
         --checkpoint checkpoints/best.pth \\
         --processed-dir cleaned/ \\
         --max-frames 50
+
+Supported checkpoint formats:
+    - Training checkpoint: {'model_state_dict': ..., 'config': ..., 'epoch': ...}
+    - Exported weights:    {'state_dict': ...} or {'weights': ...}
+    - Raw state dict:      Just the layer weights
+    - Full model:          torch.save(model, path)
         """
     )
     
     # Required arguments
     parser.add_argument('--checkpoint', required=True, type=Path,
                         help='Path to trained model checkpoint (.pth)')
-    parser.add_argument('--processed-dir', required=True, type=Path,
-                        help='Directory with preprocessed .npz frames')
+    parser.add_argument('--processed-dir', type=Path, default=None,
+                        help='Directory with preprocessed .npz frames (required unless --inspect)')
     
     # Output
     parser.add_argument('--output', '-o', type=Path, default=Path('predictions.csv'),
@@ -499,12 +668,34 @@ Examples:
                         help='Device: cuda, cpu, cuda:0, etc. (auto-detected)')
     parser.add_argument('--quiet', action='store_true',
                         help='Minimal output')
+    parser.add_argument('--inspect', action='store_true',
+                        help='Just inspect checkpoint format, don\'t run inference')
     
     args = parser.parse_args()
     
-    # Validate inputs
+    # ── Inspect mode ──────────────────────────────────────────────────────
+    if args.inspect:
+        if not args.checkpoint.exists():
+            print(f"✗ Checkpoint not found: {args.checkpoint}")
+            sys.exit(1)
+        
+        print(f"\n{'═'*60}")
+        print("  CHECKPOINT INSPECTION")
+        print(f"{'═'*60}")
+        
+        info = inspect_checkpoint(str(args.checkpoint))
+        for key, value in info.items():
+            print(f"  {key}: {value}")
+        return
+    
+    # ── Validate inputs ───────────────────────────────────────────────────
     if not args.checkpoint.exists():
         print(f"✗ Checkpoint not found: {args.checkpoint}")
+        sys.exit(1)
+    
+    if args.processed_dir is None:
+        print(f"✗ --processed-dir is required for inference")
+        print(f"  Use --inspect to just check checkpoint format")
         sys.exit(1)
     
     if not args.processed_dir.exists():
