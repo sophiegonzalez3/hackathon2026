@@ -1,205 +1,224 @@
+#!/usr/bin/env python3
 """
-Post-processing to improve predictions WITHOUT retraining.
-Apply this to your predictions.csv before evaluation.
+Merge prediction bboxes of the same class that are close together.
+Same philosophy as ground truth generation: if two bboxes of the same class
+have centers within merge_distance, merge them keeping the biggest dimensions.
 """
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from pathlib import Path
+from scipy.spatial.distance import cdist
+from typing import Dict
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION - Tune these based on your data
+# MERGE DISTANCES (same as GT config)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Per-class confidence thresholds (raise them!)
-CLASS_THRESHOLDS = {
-    'Antenna':       0.40,  # Was implicitly 0.20, your mean is 0.466
-    'Cable':         0.28,  # Aggressive filter - mean is 0.246, most are noise
-    'Electric Pole': 0.35,  # Mean is 0.402
-    'Wind Turbine':  0.25,  # Mean is 0.300
-}
-
-# Per-class max detections per frame (prevents explosion)
-CLASS_MAX_PER_FRAME = {
-    'Antenna':       10,
-    'Cable':         30,   # Cables are fragmented, allow more but not 50+
-    'Electric Pole': 8,
-    'Wind Turbine':  10,
-}
-
-# Dimension sanity filters (remove obviously wrong boxes)
-# Format: (min_val, max_val) for each dimension
-DIM_FILTERS = {
-    'Antenna': {
-        'bbox_width':  (2, 25),
-        'bbox_length': (2, 25),
-        'bbox_height': (10, 80),
-    },
-    'Cable': {
-        'bbox_width':  (5, 100),   # Allow wide range since GT is messy
-        'bbox_length': (0.3, 15),
-        'bbox_height': (0.3, 15),
-    },
-    'Electric Pole': {
-        'bbox_width':  (2, 40),
-        'bbox_length': (2, 25),
-        'bbox_height': (15, 80),
-    },
-    'Wind Turbine': {
-        'bbox_width':  (15, 150),
-        'bbox_length': (3, 50),
-        'bbox_height': (20, 200),
-    },
+MERGE_DISTANCES: Dict[str, float] = {
+    'Antenna': 30.0,
+    'Cable': 0.5,           # cables can be close (parallel lines)
+    'Electric Pole': 15.0,
+    'Wind Turbine': 50.0,
 }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# POST-PROCESSING FUNCTIONS
+# CORE MERGE LOGIC
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def apply_class_thresholds(df):
-    """Filter by per-class confidence thresholds."""
-    masks = []
-    for cls, thresh in CLASS_THRESHOLDS.items():
-        mask = (df['class_label'] == cls) & (df['confidence'] >= thresh)
-        masks.append(mask)
-    
-    keep_mask = pd.concat([pd.Series(m) for m in masks], axis=1).any(axis=1)
-    filtered = df[keep_mask].copy()
-    
-    print(f"Confidence filter: {len(df)} → {len(filtered)} ({len(df) - len(filtered)} removed)")
-    return filtered
-
-
-def apply_dimension_filters(df):
-    """Remove boxes with unrealistic dimensions."""
-    keep_mask = pd.Series([True] * len(df), index=df.index)
-    
-    for cls, filters in DIM_FILTERS.items():
-        cls_mask = df['class_label'] == cls
-        for dim, (min_val, max_val) in filters.items():
-            dim_ok = (df[dim] >= min_val) & (df[dim] <= max_val)
-            keep_mask &= ~cls_mask | dim_ok  # Keep if not this class OR dim is OK
-    
-    filtered = df[keep_mask].copy()
-    print(f"Dimension filter: {len(df)} → {len(filtered)} ({len(df) - len(filtered)} removed)")
-    return filtered
-
-
-def apply_per_frame_limits(df):
-    """Limit detections per frame per class (keep highest confidence)."""
-    results = []
-    
-    # Group by frame
-    frame_cols = ['ego_x', 'ego_y', 'ego_z', 'ego_yaw']
-    
-    for frame_id, frame_df in df.groupby(frame_cols):
-        frame_results = []
-        for cls, max_det in CLASS_MAX_PER_FRAME.items():
-            cls_df = frame_df[frame_df['class_label'] == cls]
-            if len(cls_df) > max_det:
-                cls_df = cls_df.nlargest(max_det, 'confidence')
-            frame_results.append(cls_df)
-        results.append(pd.concat(frame_results, ignore_index=True))
-    
-    filtered = pd.concat(results, ignore_index=True)
-    print(f"Per-frame limit: {len(df)} → {len(filtered)} ({len(df) - len(filtered)} removed)")
-    return filtered
-
-
-def simple_3d_nms(df, iou_threshold=0.3):
+def merge_bboxes_union_find(centers: np.ndarray, merge_distance: float) -> np.ndarray:
     """
-    Simple 3D NMS within each frame and class.
-    Removes overlapping boxes, keeping higher confidence ones.
+    Union-find to group bboxes whose centers are within merge_distance.
+    Returns array of group labels.
     """
-    def compute_iou_3d(box_a, box_b):
-        def get_corners(b):
-            cx, cy, cz = b['bbox_center_x'], b['bbox_center_y'], b['bbox_center_z']
-            w, l, h = b['bbox_width']/2, b['bbox_length']/2, b['bbox_height']/2
-            return (cx-w, cy-l, cz-h, cx+w, cy+l, cz+h)
-        
-        a, b = get_corners(box_a), get_corners(box_b)
-        x1, y1, z1 = max(a[0],b[0]), max(a[1],b[1]), max(a[2],b[2])
-        x2, y2, z2 = min(a[3],b[3]), min(a[4],b[4]), min(a[5],b[5])
-        
-        if x2 <= x1 or y2 <= y1 or z2 <= z1:
-            return 0.0
-        
-        inter = (x2-x1) * (y2-y1) * (z2-z1)
-        vol_a = (a[3]-a[0]) * (a[4]-a[1]) * (a[5]-a[2])
-        vol_b = (b[3]-b[0]) * (b[4]-b[1]) * (b[5]-b[2])
-        return inter / (vol_a + vol_b - inter + 1e-10)
+    n = len(centers)
+    if n == 0:
+        return np.array([], dtype=int)
+    if n == 1:
+        return np.array([0])
     
-    frame_cols = ['ego_x', 'ego_y', 'ego_z', 'ego_yaw']
-    results = []
+    # Compute pairwise distances
+    dists = cdist(centers, centers)
     
-    for frame_id, frame_df in df.groupby(frame_cols):
-        for cls in frame_df['class_label'].unique():
-            cls_df = frame_df[frame_df['class_label'] == cls].copy()
-            cls_df = cls_df.sort_values('confidence', ascending=False)
-            
-            keep_indices = []
-            rows = cls_df.to_dict('records')
-            
-            for i, row in enumerate(rows):
-                keep = True
-                for j in keep_indices:
-                    if compute_iou_3d(row, rows[j]) > iou_threshold:
-                        keep = False
-                        break
-                if keep:
-                    keep_indices.append(i)
-            
-            results.append(cls_df.iloc[keep_indices])
+    # Union-Find
+    parent = list(range(n))
     
-    filtered = pd.concat(results, ignore_index=True)
-    print(f"3D NMS (IoU>{iou_threshold}): {len(df)} → {len(filtered)} ({len(df) - len(filtered)} removed)")
-    return filtered
+    def find(x):
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+    
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+    
+    # Merge nearby bboxes
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dists[i, j] < merge_distance:
+                union(i, j)
+    
+    # Get group labels
+    groups = np.array([find(i) for i in range(n)])
+    
+    # Renumber to consecutive integers
+    unique_groups = np.unique(groups)
+    group_map = {g: idx for idx, g in enumerate(unique_groups)}
+    return np.array([group_map[g] for g in groups])
+
+
+def merge_group(df_group: pd.DataFrame) -> pd.Series:
+    """
+    Merge a group of bboxes into one, keeping biggest dimensions.
+    """
+    # Center = centroid of all centers
+    cx = df_group['bbox_center_x'].mean()
+    cy = df_group['bbox_center_y'].mean()
+    cz = df_group['bbox_center_z'].mean()
+    
+    # Dimensions = max of all
+    w = df_group['bbox_width'].max()
+    l = df_group['bbox_length'].max()
+    h = df_group['bbox_height'].max()
+    
+    # Yaw = from the bbox with highest confidence (or first)
+    if 'confidence' in df_group.columns:
+        best_idx = df_group['confidence'].idxmax()
+    else:
+        best_idx = df_group.index[0]
+    yaw = df_group.loc[best_idx, 'bbox_yaw']
+    
+    # Keep max confidence
+    conf = df_group['confidence'].max() if 'confidence' in df_group.columns else 1.0
+    
+    # Copy first row and update
+    result = df_group.iloc[0].copy()
+    result['bbox_center_x'] = cx
+    result['bbox_center_y'] = cy
+    result['bbox_center_z'] = cz
+    result['bbox_width'] = w
+    result['bbox_length'] = l
+    result['bbox_height'] = h
+    result['bbox_yaw'] = yaw
+    if 'confidence' in result.index:
+        result['confidence'] = conf
+    
+    return result
+
+
+def merge_frame_class(df: pd.DataFrame, merge_distance: float) -> pd.DataFrame:
+    """
+    Merge bboxes within a single frame and class.
+    """
+    if len(df) <= 1:
+        return df
+    
+    # Get centers
+    centers = df[['bbox_center_x', 'bbox_center_y', 'bbox_center_z']].values
+    
+    # Find groups
+    groups = merge_bboxes_union_find(centers, merge_distance)
+    
+    # Merge each group
+    merged_rows = []
+    for g in np.unique(groups):
+        group_df = df[groups == g]
+        merged_rows.append(merge_group(group_df))
+    
+    return pd.DataFrame(merged_rows)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def postprocess(input_csv, output_csv):
-    """Apply all post-processing steps."""
-    print(f"\n{'═'*60}")
-    print(f"  POST-PROCESSING: {input_csv}")
-    print(f"{'═'*60}\n")
+def merge_predictions(
+    input_csv: str,
+    output_csv: str,
+    merge_distances: Dict[str, float] = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Merge predictions: group by frame + class, merge nearby bboxes.
+    """
+    if merge_distances is None:
+        merge_distances = MERGE_DISTANCES
     
     df = pd.read_csv(input_csv)
-    print(f"Input: {len(df)} detections\n")
     
-    # Print initial stats
-    print("Before post-processing:")
-    print(df['class_label'].value_counts().to_string())
-    print()
+    if verbose:
+        print(f"\n{'═'*60}")
+        print(f"  MERGE PREDICTIONS")
+        print(f"{'═'*60}")
+        print(f"  Input: {len(df)} detections")
+        print(f"\n  Merge distances:")
+        for cls, dist in merge_distances.items():
+            print(f"    {cls}: {dist}m")
     
-    # Apply filters in order
-    df = apply_class_thresholds(df)
-    df = apply_dimension_filters(df)
-    df = simple_3d_nms(df, iou_threshold=0.3)
-    df = apply_per_frame_limits(df)
+    # Group by frame (ego pose) and class
+    # Frame is identified by (scene, pose_index) or (ego_x, ego_y, ego_z, ego_yaw)
+    if 'scene' in df.columns and 'pose_index' in df.columns:
+        frame_cols = ['scene', 'pose_index']
+    else:
+        frame_cols = ['ego_x', 'ego_y', 'ego_z', 'ego_yaw']
     
-    print(f"\nFinal: {len(df)} detections")
-    print("\nAfter post-processing:")
-    print(df['class_label'].value_counts().to_string())
+    merged_dfs = []
+    
+    for group_key, group_df in df.groupby(frame_cols + ['class_label']):
+        class_label = group_key[-1]  # last element is class_label
+        merge_dist = merge_distances.get(class_label, 10.0)
+        merged = merge_frame_class(group_df.copy(), merge_dist)
+        merged_dfs.append(merged)
+    
+    if merged_dfs:
+        result = pd.concat(merged_dfs, ignore_index=True)
+    else:
+        result = df.iloc[:0].copy()
+    
+    if verbose:
+        print(f"\n  Output: {len(result)} detections")
+        print(f"  Reduced by: {len(df) - len(result)} ({100*(len(df)-len(result))/max(len(df),1):.1f}%)")
+        print(f"\n  Class breakdown:")
+        for cls in ['Antenna', 'Cable', 'Electric Pole', 'Wind Turbine']:
+            before = len(df[df['class_label'] == cls])
+            after = len(result[result['class_label'] == cls])
+            print(f"    {cls}: {before} → {after}")
     
     # Save
-    df.to_csv(output_csv, index=False)
-    print(f"\n✓ Saved to {output_csv}")
+    result.to_csv(output_csv, index=False)
+    if verbose:
+        print(f"\n✓ Saved to {output_csv}")
     
-    # Print confidence stats
-    print("\nConfidence stats after filtering:")
-    for cls in ['Antenna', 'Cable', 'Electric Pole', 'Wind Turbine']:
-        cls_df = df[df['class_label'] == cls]
-        if len(cls_df) > 0:
-            print(f"  {cls}: mean={cls_df['confidence'].mean():.3f}, count={len(cls_df)}")
+    return result
 
 
 if __name__ == '__main__':
-    import sys
+    import argparse
     
-    input_csv = sys.argv[1] if len(sys.argv) > 1 else 'predictions.csv'
-    output_csv = sys.argv[2] if len(sys.argv) > 2 else 'predictions_filtered.csv'
+    parser = argparse.ArgumentParser(description='Merge nearby prediction bboxes')
+    parser.add_argument('input_csv', help='Input predictions CSV')
+    parser.add_argument('output_csv', nargs='?', default=None, help='Output CSV (default: input_merged.csv)')
+    parser.add_argument('--antenna-dist', type=float, default=30.0, help='Merge distance for Antenna')
+    parser.add_argument('--cable-dist', type=float, default=0.5, help='Merge distance for Cable')
+    parser.add_argument('--pole-dist', type=float, default=15.0, help='Merge distance for Electric Pole')
+    parser.add_argument('--turbine-dist', type=float, default=50.0, help='Merge distance for Wind Turbine')
     
-    postprocess(input_csv, output_csv)
+    args = parser.parse_args()
+    
+    # Output path
+    if args.output_csv is None:
+        inp = Path(args.input_csv)
+        args.output_csv = str(inp.with_name(inp.stem + '_merged' + inp.suffix))
+    
+    # Custom merge distances
+    merge_distances = {
+        'Antenna': args.antenna_dist,
+        'Cable': args.cable_dist,
+        'Electric Pole': args.pole_dist,
+        'Wind Turbine': args.turbine_dist,
+    }
+    
+    merge_predictions(args.input_csv, args.output_csv, merge_distances)

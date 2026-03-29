@@ -208,3 +208,13 @@ __marimo__/
 *.h5
 *.npz
 consolidated/**
+processed/
+cleaned/
+processed/
+cleaned/
+checkpoints/
+processed/
+cleaned/
+checkpoints/
+*.html
+*.bmp

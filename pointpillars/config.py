@@ -12,12 +12,11 @@ from typing import List, Dict, Tuple
 @dataclass
 class Config:
     # ── Paths ─────────────────────────────────────────────────────────────
-    processed_dir: str = "processed/"
-    gt_csv: str = "gt_runs/gt_bboxes_run_05_merge_clean.csv"
+    processed_dir: str = "cleaned/"
+    gt_csv: str = "gt_runs/gt_bboxes_clean.csv"
     class_loss_weights = None
+    train_augment : bool = True
     # ── Train / Val split (scene-level) ───────────────────────────────────
-    # Hold out 2 scenes: one "similar" (scene_9), one "different" (scene_10)
-    # to mimic the eval setup (known + unknown scenes)
     val_scenes: List[str] = field(default_factory=lambda: ["scene_9", "scene_10"])
 
     # ── Point cloud range [x_min, y_min, z_min, x_max, y_max, z_max] ─────
